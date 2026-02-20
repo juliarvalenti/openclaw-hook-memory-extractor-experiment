@@ -11,8 +11,8 @@ Validating the building blocks for a multi-agent memory architecture using OpenC
 | 1 | [Conversation extraction](#1-conversation-extraction) | ✅ Done |
 | 2 | [Programmatic agent invocation](#2-programmatic-agent-invocation) | ✅ Done |
 | 3 | [Context injection via bootstrapFiles](#3-context-injection-via-bootstrapfiles) | 🔲 Not started |
-| 4 | [Hook blocking behavior](#4-hook-blocking-behavior) | 🔲 Not started |
-| 5 | [Guardrail / flow interruption](#5-guardrail--flow-interruption) | 🔲 Not started |
+| 4 | [Hook blocking behavior](#4-hook-blocking-behavior) | ✅ Done |
+| 5 | [Guardrail / flow interruption](#5-guardrail--flow-interruption) | ✅ Done |
 | 6 | [Agent-to-agent conversation (channel-native)](#6-agent-to-agent-conversation-channel-native) | 🔲 Not started |
 | 7 | [Protocol via skill or tool](#7-protocol-via-skill-or-tool) | 💤 Low priority |
 | 8 | [Multi-agent co-coordination (trivial task)](#8-multi-agent-co-coordination-trivial-task) | 💤 Low priority |
@@ -58,9 +58,12 @@ Validating the building blocks for a multi-agent memory architecture using OpenC
 
 **Hypothesis:** OpenClaw awaits hook handlers before proceeding with the agent turn, meaning a hook can perform async work (e.g. a CFN query) and the result will be available before the agent runs.
 
-**Status:** 🔲 Not started
-**Validation:** Write a hook on `agent:bootstrap` that sleeps for 2–3 seconds, then check whether the agent turn is delayed by the same amount. If yes: hooks are blocking. If no: hooks are fire-and-forget, and injection is a race condition.
-**Why it matters:** Blocking hooks enable the coordinator loop (extract → CFN query → inject → agent turn). Fire-and-forget hooks limit hooks to observability only — injection would require a proxy layer instead.
+**Status:** ✅ Done
+**Artifact:** `poc/hook-blocking/handler.js`
+**Results:**
+- **Blocking confirmed:** 3s sleep in `agent:bootstrap` delayed agent turn by exactly 3s. Total call ~9.4s (3s hook + ~6s model).
+- **Throws are swallowed:** Hook throwing an exception does NOT abort the turn. Gateway catches all exceptions in `triggerInternalHook()` and proceeds. Confirmed in source: `internal-hooks.ts:201` wraps every handler in try/catch.
+**Conclusion:** Hooks are safe for async CFN queries. Hooks cannot be used as a guardrail/abort mechanism — they are observability + injection only.
 
 ---
 
@@ -68,14 +71,17 @@ Validating the building blocks for a multi-agent memory architecture using OpenC
 
 **Hypothesis:** A hook (or the daemon) can stop or modify an agent's execution mid-flow — not just observe it.
 
-**Status:** 🔲 Not started
-**Open questions:**
-- Can a hook throw an exception to abort a turn?
-- Does `command:stop` let the daemon halt a running agent externally?
-- Is there an HTTP endpoint or CLI command the daemon can call to interrupt execution?
-
-**Validation:** Trigger an agent with a long-running task. Mid-execution, attempt to stop it via (a) hook exception, (b) `openclaw` CLI stop command. Observe whether the turn is actually halted or just ignored.
-**Depends on:** Understanding the gateway's stop/interrupt surface area.
+**Status:** ✅ Done
+**Artifact:** `poc/guardrail-abort/abort.js`, `poc/guardrail-abort/run-test.sh`
+**Results:**
+- **Hook throw:** swallowed, agent proceeds (see #4)
+- **`chat.abort` RPC:** does NOT work for `openclaw agent` CLI-initiated runs — those use the `agent` RPC method and register in `ACTIVE_EMBEDDED_RUNS`, not `chatAbortControllers`. `chat.abort` only affects `chat.send`-initiated runs.
+- **`sessions.reset` RPC:** ✅ **Works.** Calls `abortEmbeddedPiRun()` which fires the `AbortController` on the active run. Confirmed by timing: `sleep 30` task aborted mid-execution (~44s total vs 35s+ without abort), agent returned only partial response `"I'll run the sleep command and then tell you the time."`.
+- **No CLI stop command:** no `openclaw abort <session>` exists. All abort RPCs are WebSocket-only.
+**Caveats:**
+- `sessions.reset` resets session history (new sessionId). Use `sessions.delete` to fully remove.
+- Auth requires a paired device identity + Ed25519 signature, not just the gateway auth token. Scopes are wiped for unpaired connections (`internal-hooks.ts:420`).
+- The daemon must maintain a paired device identity to use abort RPC calls.
 
 ---
 
