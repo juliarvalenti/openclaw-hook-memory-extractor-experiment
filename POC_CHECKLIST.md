@@ -10,7 +10,7 @@ Validating the building blocks for a multi-agent memory architecture using OpenC
 |---|---|---|
 | 1 | [Conversation extraction](#1-conversation-extraction) | ✅ Done |
 | 2 | [Programmatic agent invocation](#2-programmatic-agent-invocation) | ✅ Done |
-| 3 | [Context injection via bootstrapFiles](#3-context-injection-via-bootstrapfiles) | 🔲 Not started |
+| 3 | [Context injection via bootstrapFiles](#3-context-injection-via-bootstrapfiles) | ✅ Done |
 | 4 | [Hook blocking behavior](#4-hook-blocking-behavior) | ✅ Done |
 | 5 | [Guardrail / flow interruption](#5-guardrail--flow-interruption) | ✅ Done |
 | 6 | [Agent-to-agent conversation (channel-native)](#6-agent-to-agent-conversation-channel-native) | 🔲 Not started |
@@ -46,11 +46,13 @@ Validating the building blocks for a multi-agent memory architecture using OpenC
 
 **Hypothesis:** A hook can inject external context (e.g. CFN memory query results) into an agent's system prompt before each turn, without any explicit request from the agent — enabling the full coordinator loop.
 
-**Status:** 🔲 Not started
-**Mechanism:** `agent:bootstrap` event exposes a mutable `context.bootstrapFiles` array. Writing to it injects content into the agent's context before the turn runs.
-**Validation:** Write a hook that appends a test file to `bootstrapFiles`. Confirm the agent receives and acknowledges the injected content in its response.
-**Depends on:** [#4 Hook blocking behavior](#4-hook-blocking-behavior) — injection is only reliable if the hook is awaited before the turn starts.
-**Reference:** `$(npm root -g)/openclaw/dist/bundled/bootstrap-extra-files/handler.js`
+**Status:** ✅ Done
+**Artifact:** `poc/bootstrap-inject/handler.js`
+**Result:** `context.bootstrapFiles` is mutable and the mutation propagates to the agent runner. Content injected inline (no file on disk required) via `{ name, path, content, missing: false }`. Confirmed: agent received and recited codeword `ZEPHYR-7742` injected as synthetic `MEMORY.md` content.
+**Notes:**
+- The injected file appears in the system prompt labeled by its `path` value, not its `name` — ask the agent about the path, not "MEMORY.md", for reliable retrieval.
+- `systemPromptReport.injectedWorkspaceFiles` in the `--json` response confirms injection at the system level (shows `chars=174`, `missing=false`).
+- Content can be updated at runtime via `~/.openclaw/inject-payload.json` without restarting the gateway (hook reads the file on every invocation).
 
 ---
 
