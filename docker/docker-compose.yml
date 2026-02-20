@@ -1,0 +1,116 @@
+# Multi-agent OpenClaw setup for PoC #6 (channel-native agent coordination)
+#
+# Each agent runs its own gateway container — mirroring the distributed
+# deployment target where each agent lives on a separate host.
+#
+# All agents connect to a shared Ergo IRC server on the `agents` Docker
+# network. The IRC channel (#agents) is the coordination medium for PoC #6.
+#
+# Usage:
+#   docker compose up                     # start IRC + all three agents
+#   docker compose up irc agent-a agent-b # start IRC + two agents
+#   docker compose logs -f agent-a        # tail one agent
+#   docker compose down                   # stop everything
+#
+# Prerequisites:
+#   1. Build the OpenClaw image (from openclaw repo root):
+#        docker build -t openclaw:local .
+#   2. Copy .env.example → .env and fill in ANTHROPIC_API_KEY (or OPENAI_API_KEY, etc.)
+#
+# To add a 4th agent, copy one of the agent-* service blocks, update:
+#   - service name
+#   - OPENCLAW_GATEWAY_TOKEN env var name (and add to .env.example)
+#   - IRC_NICK
+#   - host port mapping
+#   - volumes path (configs/agent-d)
+
+services:
+
+  # ── IRC server ──────────────────────────────────────────────────────────────
+  # Ergo is a modern, self-contained IRC server. No external dependencies.
+  # Plain text on port 6667 — TLS not needed for internal Docker networking.
+  # No port exposed to host by default; add "6667:6667" under ports: if you
+  # want to connect with an IRC client for debugging.
+  irc:
+    image: ghcr.io/ergochat/ergo:stable
+    volumes:
+      - ./ergo/ircd.yaml:/ircd/ircd.yaml:ro
+    networks:
+      - agents
+    restart: unless-stopped
+
+  # ── Agent A ─────────────────────────────────────────────────────────────────
+  agent-a:
+    image: ${OPENCLAW_IMAGE:-openclaw:local}
+    environment:
+      HOME: /home/node
+      # LLM provider key — set in .env. Swap for OPENAI_API_KEY etc. if desired.
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+      # Gateway auth token — used to connect to this agent's gateway via WS.
+      OPENCLAW_GATEWAY_TOKEN: ${AGENT_A_TOKEN:?AGENT_A_TOKEN is required}
+      # IRC connection (resolved at runtime by the irc channel plugin).
+      IRC_HOST: irc
+      IRC_PORT: "6667"
+      IRC_TLS: "false"
+      IRC_NICK: agent-a
+      IRC_CHANNELS: "#agents"
+    volumes:
+      - ./configs/agent-a:/home/node/.openclaw
+    ports:
+      - "${AGENT_A_PORT:-18789}:18789"
+    networks:
+      - agents
+    depends_on:
+      - irc
+    command: ["node", "dist/index.js", "gateway", "--bind", "lan"]
+    restart: unless-stopped
+
+  # ── Agent B ─────────────────────────────────────────────────────────────────
+  agent-b:
+    image: ${OPENCLAW_IMAGE:-openclaw:local}
+    environment:
+      HOME: /home/node
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+      OPENCLAW_GATEWAY_TOKEN: ${AGENT_B_TOKEN:?AGENT_B_TOKEN is required}
+      IRC_HOST: irc
+      IRC_PORT: "6667"
+      IRC_TLS: "false"
+      IRC_NICK: agent-b
+      IRC_CHANNELS: "#agents"
+    volumes:
+      - ./configs/agent-b:/home/node/.openclaw
+    ports:
+      - "${AGENT_B_PORT:-18889}:18789"
+    networks:
+      - agents
+    depends_on:
+      - irc
+    command: ["node", "dist/index.js", "gateway", "--bind", "lan"]
+    restart: unless-stopped
+
+  # ── Agent C ─────────────────────────────────────────────────────────────────
+  agent-c:
+    image: ${OPENCLAW_IMAGE:-openclaw:local}
+    environment:
+      HOME: /home/node
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+      OPENCLAW_GATEWAY_TOKEN: ${AGENT_C_TOKEN:?AGENT_C_TOKEN is required}
+      IRC_HOST: irc
+      IRC_PORT: "6667"
+      IRC_TLS: "false"
+      IRC_NICK: agent-c
+      IRC_CHANNELS: "#agents"
+    volumes:
+      - ./configs/agent-c:/home/node/.openclaw
+    ports:
+      - "${AGENT_C_PORT:-18989}:18789"
+    networks:
+      - agents
+    depends_on:
+      - irc
+    command: ["node", "dist/index.js", "gateway", "--bind", "lan"]
+    restart: unless-stopped
+
+networks:
+  agents:
+    driver: bridge

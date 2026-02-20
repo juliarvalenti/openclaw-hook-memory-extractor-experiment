@@ -181,3 +181,16 @@ hook/
 sample-output.json — Real captured session (15 turns)
 setup.sh        — Install/uninstall script
 ```
+
+### Reference — OpenClaw internals consulted
+
+These files were read during development and are useful for understanding the hook system:
+
+| File | Notes |
+|---|---|
+| [docs.openclaw.ai/cli/hooks](https://docs.openclaw.ai/cli/hooks) | Hook enable/disable/install CLI |
+| [docs.openclaw.ai/automation/hooks](https://docs.openclaw.ai/automation/hooks) | Custom hook authoring, event list |
+| `$(npm root -g)/openclaw/dist/bundled/session-memory/handler.js` | Bundled hook — session file reading pattern |
+| `$(npm root -g)/openclaw/dist/bundled/command-logger/handler.js` | Bundled hook — simplest handler example |
+| `$(npm root -g)/openclaw/dist/bundled/boot-md/handler.js` | Bundled hook — `gateway:startup` event usage |
+| `$(npm root -g)/openclaw/dist/bundled/bootstrap-extra-files/handler.js` | Bundled hook — `agent:bootstrap` event usage |

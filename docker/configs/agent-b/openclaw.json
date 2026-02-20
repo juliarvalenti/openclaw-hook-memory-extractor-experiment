@@ -1,0 +1,30 @@
+{
+  "agents": {
+    "defaults": {
+      "model": {
+        "primary": "anthropic/claude-haiku-4-5-20251001"
+      }
+    }
+  },
+  "gateway": {
+    "port": 18789,
+    "bind": "lan"
+  },
+  "plugins": {
+    "entries": {
+      "irc": {
+        "enabled": true
+      }
+    }
+  },
+  "channels": {
+    "irc": {
+      "groupPolicy": "open",
+      "groups": {
+        "#agents": {
+          "requireMention": false
+        }
+      }
+    }
+  }
+}

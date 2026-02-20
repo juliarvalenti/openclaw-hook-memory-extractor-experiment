@@ -1,0 +1,52 @@
+# Minimal Ergo IRC config for multi-agent PoC
+# Plain text, no TLS, no account registration required.
+# Agents connect as anonymous clients and join #agents automatically.
+
+network:
+  name: AgentNet
+
+server:
+  name: irc.local
+  listeners:
+    # Plain text on 6667 — no TLS needed inside Docker network.
+    ":6667": {}
+  max-sendq: 1M
+  relaymsg:
+    enabled: false
+  # Don't try to resolve client IPs to hostnames — slows down connects.
+  lookup-hostnames: false
+  # Allow clients to connect even if their IP can't be resolved.
+  ip-cloaking:
+    enabled: false
+
+accounts:
+  # No account system — agents connect without registering.
+  authentication-enabled: false
+  registration:
+    enabled: false
+
+channels:
+  # Default channel modes: +n (no external messages) +t (ops set topic).
+  default-modes: +nt
+  registration:
+    # Channels don't need to be registered to persist while anyone is in them.
+    enabled: false
+
+datastore:
+  path: /ircd/ircd.db
+
+logging:
+  - method: stderr
+    type: "* -userinput -useroutput"
+    level: info
+
+limits:
+  nicklen: 32
+  channellen: 64
+  awaylen: 200
+  kicklen: 1000
+  topiclen: 1000
+  whowas-entries: 100
+
+history:
+  enabled: false
