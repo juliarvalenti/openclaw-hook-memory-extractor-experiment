@@ -2,13 +2,10 @@
  * conversation-extractor
  *
  * Reads the session JSONL at agent bootstrap time and emits a structured
- * conversation payload — optimized for ingestion into a memory/analytics
- * service targeting multi-agent systems.
+ * conversation payload for ingestion into a memory/analytics service.
  *
  * Output:
- *   ~/.openclaw/conversation-extractor.log   — optimized (default)
- *   ~/.openclaw/conversation-extractor-verbose.log — full raw entries
- *     (set OPENCLAW_EXTRACTOR_VERBOSE=1 to enable)
+ *   ~/.openclaw/conversation-extractor.log
  *
  * Hook events: agent:bootstrap, command:new
  */
@@ -20,13 +17,6 @@ import os from "os";
 
 const STATE_DIR = path.join(os.homedir(), ".openclaw");
 const LOG_FILE = path.join(STATE_DIR, "conversation-extractor.log");
-const VERBOSE_LOG_FILE = path.join(STATE_DIR, "conversation-extractor-verbose.log");
-const VERBOSE = process.env.OPENCLAW_EXTRACTOR_VERBOSE === "1";
-
-// How much to preview before truncating (bytes)
-const THINKING_PREVIEW = 400;
-const RESPONSE_PREVIEW = 600;
-const TOOL_RESULT_PREVIEW = 300;
 
 // ── Session file resolution ──────────────────────────────────────────────────
 
@@ -55,7 +45,8 @@ async function readSessionEntries(filePath) {
 //   { type: "message", message: { role: "user"|"assistant"|"toolResult", content: [...] } }
 //
 // Assistant content block types: "thinking", "text", "toolCall"
-// toolResult content: [{ toolUseId, type, text, isError }]
+// Assistant message fields: model, stopReason, usage (input/output/cacheRead/cacheWrite/cost)
+// toolResult content: [{ type, text }], plus toolCallId and isError on the message
 
 function extractTextFromContent(content) {
   if (!content) return "";
@@ -69,11 +60,27 @@ function extractTextFromContent(content) {
   return "";
 }
 
+function addUsage(acc, usage) {
+  if (!usage) return acc;
+  return {
+    input:       (acc.input       ?? 0) + (usage.input       ?? 0),
+    output:      (acc.output      ?? 0) + (usage.output      ?? 0),
+    cacheRead:   (acc.cacheRead   ?? 0) + (usage.cacheRead   ?? 0),
+    cacheWrite:  (acc.cacheWrite  ?? 0) + (usage.cacheWrite  ?? 0),
+    totalTokens: (acc.totalTokens ?? 0) + (usage.totalTokens ?? 0),
+    cost: {
+      input:      (acc.cost?.input      ?? 0) + (usage.cost?.input      ?? 0),
+      output:     (acc.cost?.output     ?? 0) + (usage.cost?.output     ?? 0),
+      cacheRead:  (acc.cost?.cacheRead  ?? 0) + (usage.cost?.cacheRead  ?? 0),
+      cacheWrite: (acc.cost?.cacheWrite ?? 0) + (usage.cost?.cacheWrite ?? 0),
+      total:      (acc.cost?.total      ?? 0) + (usage.cost?.total      ?? 0),
+    },
+  };
+}
+
 function extractTurns(entries) {
   const turns = [];
   let current = null;
-
-  // Index tool calls by id so we can match results later
   const pendingToolCalls = {};
 
   for (const entry of entries) {
@@ -89,9 +96,18 @@ function extractTurns(entries) {
         thinking: [],
         toolCalls: [],
         response: "",
+        model: null,
+        stopReason: null,
+        usage: {},
       };
 
     } else if (role === "assistant" && current) {
+      // A single logical turn can contain multiple assistant messages (tool call chains).
+      // Accumulate usage across all of them; last model/stopReason wins.
+      current.usage = addUsage(current.usage, entry.message.usage);
+      if (entry.message.model) current.model = entry.message.model;
+      if (entry.message.stopReason) current.stopReason = entry.message.stopReason;
+
       const blocks = Array.isArray(content) ? content : [];
       for (const block of blocks) {
         if (!block?.type) continue;
@@ -119,7 +135,6 @@ function extractTurns(entries) {
       }
 
     } else if (role === "toolResult" && current) {
-      // toolCallId is on the message, isError is on the message
       const id = entry.message.toolCallId ?? entry.message.toolUseId ?? null;
       const tc = id ? pendingToolCalls[id] : null;
       if (tc) {
@@ -138,15 +153,34 @@ function finalizeTurn(turn) {
   return {
     ...turn,
     thinking: turn.thinking.join("\n\n"),
+    usage: Object.keys(turn.usage).length ? turn.usage : null,
   };
 }
 
-// ── Optimized payload ─────────────────────────────────────────────────────────
-//
-// Strips bulk, keeps structure. Designed to be small enough to ship to a
-// remote collector without crazy wire overhead.
+// ── Session metadata ──────────────────────────────────────────────────────────
 
-function buildOptimizedPayload(sessionMeta, turns, entries) {
+function resolveSessionMeta(event, entries) {
+  const ctx = event.context ?? {};
+  const agentId = ctx.agentId ?? null;
+  const sessionId = ctx.sessionId ?? null;
+  const sessionKey = event.sessionKey ?? null;
+
+  const channelFromKey = sessionKey
+    ? sessionKey.replace(`agent:${agentId}:`, "").split(":")[0]
+    : null;
+
+  // cwd from the session header entry (first entry in the JSONL)
+  const sessionEntry = entries.find((e) => e.type === "session");
+  const cwd = sessionEntry?.cwd ?? null;
+
+  return { agentId, sessionId, sessionKey, channel: channelFromKey, cwd };
+}
+
+// ── Payload ───────────────────────────────────────────────────────────────────
+
+function buildPayload(sessionMeta, turns, entries) {
+  const totalCost = turns.reduce((sum, t) => sum + (t.usage?.cost?.total ?? 0), 0);
+
   return {
     schema: "openclaw-conversation-v1",
     extractedAt: new Date().toISOString(),
@@ -156,29 +190,26 @@ function buildOptimizedPayload(sessionMeta, turns, entries) {
       turns: turns.length,
       toolCallCount: turns.reduce((n, t) => n + t.toolCalls.length, 0),
       thinkingTurnCount: turns.filter((t) => t.thinking.length > 0).length,
+      totalCost,
     },
     turns: turns.map((t) => ({
       index: t.index,
       timestamp: t.timestamp,
-      userMessage: truncate(t.userMessage, RESPONSE_PREVIEW),
-      thinking: truncate(t.thinking, THINKING_PREVIEW) || null,
+      model: t.model,
+      stopReason: t.stopReason,
+      usage: t.usage,
+      userMessage: t.userMessage,
+      thinking: t.thinking || null,
       toolCalls: t.toolCalls.map((tc) => ({
+        id: tc.id,
         name: tc.name,
-        // Omit full input — just surface the keys so the collector knows what
-        // was invoked without shipping potentially large file contents etc.
-        inputKeys: tc.input ? Object.keys(tc.input) : [],
-        inputPreview: truncate(JSON.stringify(tc.input), 200),
-        resultPreview: truncate(tc.result, TOOL_RESULT_PREVIEW),
+        input: tc.input,
+        result: tc.result,
         isError: tc.isError,
       })),
-      response: truncate(t.response, RESPONSE_PREVIEW),
+      response: t.response || null,
     })),
   };
-}
-
-function truncate(str, max) {
-  if (!str) return str;
-  return str.length <= max ? str : str.slice(0, max) + `… [+${str.length - max}]`;
 }
 
 // ── I/O ───────────────────────────────────────────────────────────────────────
@@ -186,27 +217,6 @@ function truncate(str, max) {
 function appendLog(filePath, data) {
   const sep = "\n" + "=".repeat(80) + "\n";
   fs.appendFileSync(filePath, sep + JSON.stringify(data, null, 2) + "\n");
-}
-
-// ── Session metadata from hook event ─────────────────────────────────────────
-
-function resolveSessionMeta(event) {
-  const ctx = event.context ?? {};
-  const agentId = ctx.agentId ?? null;
-  const sessionId = ctx.sessionId ?? null;
-  const sessionKey = event.sessionKey ?? null;
-
-  // Pull model from cfg if available
-  const model =
-    ctx.cfg?.agents?.defaults?.model?.primary ?? null;
-
-  // Pull channel from sessionKey heuristic
-  // sessionKey format: "agent:{agentId}:{channel}:{...}" or "agent:{agentId}:main"
-  const channelFromKey = sessionKey
-    ? sessionKey.replace(`agent:${agentId}:`, "").split(":")[0]
-    : null;
-
-  return { agentId, sessionId, sessionKey, channel: channelFromKey, model };
 }
 
 // ── Handler ───────────────────────────────────────────────────────────────────
@@ -217,25 +227,19 @@ export default async function HookHandler(event) {
 
   if (!isBootstrap && !isCommandNew) return;
 
-  const meta = resolveSessionMeta(event);
-  if (!meta.agentId || !meta.sessionId) return;
+  const ctx = event.context ?? {};
+  const agentId = ctx.agentId ?? null;
+  const sessionId = ctx.sessionId ?? null;
+  if (!agentId || !sessionId) return;
 
-  const sessionFile = resolveSessionFile(meta.agentId, meta.sessionId);
+  const sessionFile = resolveSessionFile(agentId, sessionId);
   const entries = await readSessionEntries(sessionFile);
   if (entries.length === 0) return;
 
   const turns = extractTurns(entries);
   if (turns.length === 0) return;
 
-  const optimized = buildOptimizedPayload(meta, turns, entries);
-  appendLog(LOG_FILE, optimized);
-
-  if (VERBOSE) {
-    appendLog(VERBOSE_LOG_FILE, {
-      schema: "openclaw-conversation-raw-v1",
-      session: meta,
-      extractedAt: new Date().toISOString(),
-      entries,
-    });
-  }
+  const meta = resolveSessionMeta(event, entries);
+  const payload = buildPayload(meta, turns, entries);
+  appendLog(LOG_FILE, payload);
 }
