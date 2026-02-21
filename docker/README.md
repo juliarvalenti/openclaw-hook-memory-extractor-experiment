@@ -1,6 +1,6 @@
 # Docker Compose — Multi-Agent OpenClaw
 
-Three OpenClaw agents + an Ergo IRC server, all on an isolated Docker network.
+Three OpenClaw agents + a Synapse Matrix homeserver, all on an isolated Docker network.
 
 Each agent has its own gateway container (port 18789 inside, different host ports outside).
 This mirrors the distributed deployment target where each agent runs on a separate host.
@@ -19,7 +19,7 @@ docker build -t openclaw:local .
 
 ```bash
 cp .env.example .env
-# Edit .env: fill in ANTHROPIC_API_KEY and generate tokens
+# Edit .env: fill in ANTHROPIC_API_KEY, agent passwords, and generate gateway tokens
 ```
 
 Generate gateway tokens:
@@ -27,16 +27,22 @@ Generate gateway tokens:
 openssl rand -hex 24   # run once per agent, paste into .env
 ```
 
+**3. Run one-time setup** (initializes Synapse and registers users):
+
+```bash
+bash setup.sh
+```
+
 ---
 
 ## Usage
 
 ```bash
-# Start everything (IRC + all 3 agents)
+# Start everything (Matrix + all 3 agents)
 docker compose up
 
-# Start IRC + only two agents
-docker compose up irc agent-a agent-b
+# Start Matrix + only two agents
+docker compose up matrix agent-a agent-b
 
 # Tail logs for one agent
 docker compose logs -f agent-a
@@ -51,14 +57,14 @@ docker compose down
 
 ```
 Docker network: agents
-  ├── irc          Ergo IRC server, :6667 (plain text)
-  ├── agent-a      OpenClaw gateway → host:18789, nick: agent-a
-  ├── agent-b      OpenClaw gateway → host:18889, nick: agent-b
-  └── agent-c      OpenClaw gateway → host:18989, nick: agent-c
+  ├── matrix       Synapse Matrix homeserver, :8008
+  ├── agent-a      OpenClaw gateway → host:18789, Matrix: @agent-a:local
+  ├── agent-b      OpenClaw gateway → host:18889, Matrix: @agent-b:local
+  └── agent-c      OpenClaw gateway → host:18989, Matrix: @agent-c:local
 ```
 
-All agents auto-join `#agents` on startup. `requireMention: false` is set so
-agents respond to any message in the channel without needing to be @-mentioned.
+All agents auto-join `#agents:local` on startup. `requireMention: true` is set so
+agents only respond when @mentioned.
 
 Connect to an agent's gateway from the host:
 ```
@@ -69,17 +75,34 @@ ws://127.0.0.1:18989   (agent-c)
 
 ---
 
-## Debugging the IRC channel
+## Observing the room
 
-To connect with an IRC client and observe the #agents channel:
+Install Element and connect to the local homeserver:
 
-```yaml
-# Add to irc service in docker-compose.yml:
-ports:
-  - "6667:6667"
+```bash
+brew install --cask element
 ```
 
-Then connect any IRC client to `localhost:6667`, join `#agents`.
+- Homeserver: `http://localhost:8008`
+- Username: `@observer:local`
+- Password: printed at end of `setup.sh` (default: `observer123`)
+
+Join `#agents:local` to watch agents interact.
+
+---
+
+## Agent-to-agent mentions
+
+Agents use the full `@user:server` format to mention each other:
+
+```
+@agent-b:local can you handle this?   ✅
+@agent-b can you handle this?         ❌ (won't be detected)
+```
+
+Each agent has `messages.groupChat.mentionPatterns` configured with its own name
+so plain-text mentions from other agents are detected correctly (since bot-sent
+messages don't carry `m.mentions` metadata the way human clients do).
 
 ---
 
@@ -88,9 +111,9 @@ Then connect any IRC client to `localhost:6667`, join `#agents`.
 Edit `configs/agent-*/openclaw.json` → `agents.defaults.model.primary`:
 
 ```json
-{ "primary": "anthropic/claude-haiku-4-5-20251001" }  # Anthropic (default)
-{ "primary": "openai/gpt-5-mini" }                     # OpenAI
-{ "primary": "openrouter/google/gemini-flash-1.5" }    # via OpenRouter
+{ "primary": "anthropic/claude-haiku-4-5-20251001" }  // Anthropic (default)
+{ "primary": "openai/gpt-4o-mini" }                    // OpenAI
+{ "primary": "openrouter/google/gemini-flash-1.5" }    // via OpenRouter
 ```
 
 Set the corresponding key in `.env`:
@@ -104,7 +127,9 @@ OPENROUTER_API_KEY=...
 
 ## Adding a 4th agent
 
-1. Copy a service block in `docker-compose.yml`, update: service name, `IRC_NICK`,
-   `OPENCLAW_GATEWAY_TOKEN` var name, host port mapping, `volumes` path.
-2. Create `configs/agent-d/openclaw.json` (copy any existing one).
-3. Add `AGENT_D_TOKEN` to `.env`.
+1. Copy a service block in `docker-compose.yml`, update: service name,
+   `MATRIX_USER_ID`, `MATRIX_PASSWORD` var name, host port mapping, `volumes` path.
+2. Create `configs/agent-d/` with `openclaw.json` (copy any existing one), update
+   `messages.groupChat.mentionPatterns` to `["agent-d"]`.
+3. Register the user: add a `register "agent-d" "${AGENT_D_MATRIX_PASSWORD}"` line to `setup.sh`.
+4. Add `AGENT_D_MATRIX_PASSWORD` to `.env`.

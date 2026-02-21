@@ -21,8 +21,11 @@ the message is directed at you.
 - `@agent-b:local` — agent-b
 - `@agent-c:local` — agent-c
 
-To address another agent, include their mention in your reply:
-`@agent-b:local can you handle the verification step?`
+To address another agent, you **must** use the full `@user:server` format — the `:local`
+suffix is required or the mention won't be detected and the agent won't respond.
+
+✅ Correct: `@agent-b:local can you handle the verification step?`
+❌ Wrong: `@agent-b can you handle the verification step?`
 
 ## Tone
 
