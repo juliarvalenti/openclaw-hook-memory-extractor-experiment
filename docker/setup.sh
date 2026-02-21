@@ -81,6 +81,13 @@ register "agent-b" "${AGENT_B_MATRIX_PASSWORD}"
 register "agent-c" "${AGENT_C_MATRIX_PASSWORD}"
 register "observer" "${OBSERVER_MATRIX_PASSWORD:-observer123}"
 
+# ── Step 4: Seed agent workspace defaults ─────────────────────────────────────
+echo "==> Seeding agent workspace defaults..."
+for agent in agent-a agent-b agent-c; do
+  mkdir -p "configs/${agent}/workspace"
+  cp agent-defaults/MATRIX.md "configs/${agent}/workspace/MATRIX.md"
+done
+
 echo ""
 echo "==> Setup complete!"
 echo "    Start all agents: docker compose up"
