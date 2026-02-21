@@ -13,7 +13,7 @@ Validating the building blocks for a multi-agent memory architecture using OpenC
 | 3 | [Context injection via bootstrapFiles](#3-context-injection-via-bootstrapfiles) | ✅ Done |
 | 4 | [Hook blocking behavior](#4-hook-blocking-behavior) | ✅ Done |
 | 5 | [Guardrail / flow interruption](#5-guardrail--flow-interruption) | ✅ Done |
-| 6 | [Agent-to-agent conversation (channel-native)](#6-agent-to-agent-conversation-channel-native) | 🔲 Not started |
+| 6 | [Agent-to-agent conversation (channel-native)](#6-agent-to-agent-conversation-channel-native) | ✅ Done |
 | 7 | [Protocol via skill or tool](#7-protocol-via-skill-or-tool) | 💤 Low priority |
 | 8 | [Multi-agent co-coordination (trivial task)](#8-multi-agent-co-coordination-trivial-task) | 💤 Low priority |
 | 9 | [Multi-agent co-coordination (protocol-enhanced)](#9-multi-agent-co-coordination-protocol-enhanced) | 💤 Low priority |
@@ -89,12 +89,20 @@ Validating the building blocks for a multi-agent memory architecture using OpenC
 
 ### 6. Agent-to-agent conversation (channel-native)
 
-**Hypothesis:** Two OpenClaw agents connected to the same channel (e.g. IRC) can converse directly — agent A's response triggers agent B without the daemon relaying each turn.
+**Hypothesis:** Two OpenClaw agents connected to the same channel can converse directly — agent A's response triggers agent B without the daemon relaying each turn.
 
-**Status:** 🔲 Not started
-**Context:** Daemon-mediated relay (PoC #2) already works. This tests whether a *channel-native* pattern is viable — agents coordinate autonomously, daemon observes but doesn't broker every hop.
-**Setup required:** Docker Compose with two agent gateways + an IRC server (or OpenClaw WebChat), both agents subscribed to the same channel.
-**Open question:** Does OpenClaw treat one agent's outbound message as an inbound trigger for another agent on the same channel? Or are responses "outbound only"?
+**Status:** ✅ Done
+**Artifact:** `docker/`, `MULTIAGENT.md`
+**Results:**
+- Three agents (agent-a, agent-b, agent-c) running in Docker Compose, each with their own gateway container
+- Shared Matrix homeserver (Synapse) provides the coordination channel (`#agents:local`)
+- Agents respond when @mentioned in the room; they can @mention each other to delegate tasks
+- Channel-native coordination confirmed: no daemon brokering each hop
+- `requireMention: true` recommended — prevents all agents piling on every message
+**Notes:**
+- Matrix chosen over IRC: Matrix's `startAccount` blocks correctly (no restart loop bug that affects the IRC plugin)
+- The `openclaw:local` Docker image is missing Matrix plugin deps (`@vector-im/matrix-bot-sdk`) because the upstream Dockerfile runs `pnpm install` before copying `extensions/*/package.json`. Fixed via a derived `docker/Dockerfile` that re-runs `pnpm install --frozen-lockfile` on top of the base image.
+- Hot reload works: changes to `configs/agent-*/openclaw.json` are picked up live without container restart for most settings.
 
 ---
 
@@ -129,21 +137,15 @@ Validating the building blocks for a multi-agent memory architecture using OpenC
 
 ## Docker Compose Setup
 
-Required for PoCs #6, #8, #9. Each agent runs its own gateway container — this mirrors the distributed deployment target (separate gateways on separate hosts).
+✅ Implemented in `docker/`. See [`MULTIAGENT.md`](./MULTIAGENT.md) for full setup instructions.
 
-**Planned topology:**
+**Actual topology:**
 ```
 docker-compose
-  ├── agent-a-gateway   (openclaw gateway, port 18789)
-  ├── agent-b-gateway   (openclaw gateway, port 18789, different host)
-  ├── agent-c-gateway   (openclaw gateway, port 18789, different host)
-  ├── irc-server        (for channel-native PoC #6)
-  └── daemon            (HiveMind daemon, coordinates via connector pattern)
+  ├── agent-a   (openclaw gateway, host port 18789)
+  ├── agent-b   (openclaw gateway, host port 18889)
+  ├── agent-c   (openclaw gateway, host port 18989)
+  └── matrix    (Synapse homeserver, host port 8008)
 ```
 
-Config is parameterized so N agents can be added without restructuring. Each agent container gets:
-- Its own `openclaw.json` (agent name, model, channel config)
-- `ANTHROPIC_API_KEY` from env
-- Optional: mounted hook directory for the conversation extractor
-
-**Status:** 🔲 Not started
+Each agent container gets its own `openclaw.json` (volume-mounted at `/home/node/.openclaw`), with Matrix credentials supplied via env vars (`MATRIX_HOMESERVER`, `MATRIX_USER_ID`, `MATRIX_PASSWORD`). LLM provider is also env-configurable — swap `ANTHROPIC_API_KEY` for `OPENAI_API_KEY` etc. and update the model string in `openclaw.json`.

@@ -172,14 +172,29 @@ A memory service would index by `sessionKey` and emit each bootstrap as a delta 
 
 ---
 
+## Multi-agent setup
+
+A Docker Compose environment for running three agents coordinating via a shared
+Matrix room is in `docker/`. See [`MULTIAGENT.md`](./MULTIAGENT.md) for full
+setup and Element connection instructions.
+
+---
+
 ## Files
 
 ```
 hook/
-  HOOK.md       — OpenClaw hook metadata (name, events, emoji)
-  handler.js    — Hook handler (the extractor)
-sample-output.json — Real captured session (15 turns)
-setup.sh        — Install/uninstall script
+  HOOK.md           — OpenClaw hook metadata (name, events, emoji)
+  handler.js        — Hook handler (the extractor)
+docker/
+  docker-compose.yml  — Three-agent + Synapse Matrix setup
+  Dockerfile          — Extends openclaw:local with Matrix plugin deps
+  setup.sh            — One-time Synapse init + user registration
+  configs/agent-{a,b,c}/openclaw.json  — Per-agent config (volume-mounted)
+  .env.example        — Environment variable template
+MULTIAGENT.md       — Multi-agent Docker + Element setup guide
+sample-output.json  — Real captured session (15 turns)
+setup.sh            — Hook install/uninstall script
 ```
 
 ### Reference — OpenClaw internals consulted

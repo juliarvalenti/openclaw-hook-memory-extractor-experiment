@@ -1,0 +1,17 @@
+# Environment variables (contain API keys and passwords)
+docker/.env
+
+# Synapse homeserver data (signing keys, database, media)
+docker/synapse/data/
+
+# Agent runtime state (sessions, Matrix credentials, cron state, workspace)
+docker/configs/*/agents/
+docker/configs/*/canvas/
+docker/configs/*/credentials/
+docker/configs/*/cron/
+docker/configs/*/matrix/
+docker/configs/*/workspace/
+docker/configs/*/update-check.json
+
+# ngircd/ergo configs (replaced by Matrix)
+docker/ngircd/
