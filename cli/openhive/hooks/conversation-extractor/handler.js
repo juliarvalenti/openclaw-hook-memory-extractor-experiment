@@ -1,12 +1,13 @@
 /**
  * conversation-extractor/handler.js
  *
- * Reads the session JSONL at agent bootstrap time and emits a structured
+ * Reads the session JSONL after each agent response and emits a structured
  * conversation payload for ingestion into a memory/analytics service.
  *
- * Output: ~/.openclaw/conversation-extractor.log
+ * Output: $OPENCLAW_EXTRACTOR_OUTPUT/conversation-extractor.log
+ *         (falls back to ~/.openclaw/conversation-extractor.log)
  *
- * Hook events: agent:bootstrap, command:new
+ * Hook events: agent:bootstrap, message:sent
  *
  * Installed by: openhive agent configure <framework>
  */
@@ -16,11 +17,30 @@ import fsPromises from "fs/promises";
 import path from "path";
 import os from "os";
 
-const STATE_DIR = path.join(os.homedir(), ".openclaw");
-const LOG_FILE = path.join(STATE_DIR, "conversation-extractor.log");
+// Write to /logs if OPENCLAW_EXTRACTOR_OUTPUT is set (Docker mount), else ~/.openclaw
+const OUTPUT_DIR   = process.env.OPENCLAW_EXTRACTOR_OUTPUT ?? path.join(os.homedir(), ".openclaw");
+const LOG_FILE     = path.join(OUTPUT_DIR, "conversation-extractor.log");
+
+const STATE_DIR    = path.join(os.homedir(), ".openclaw");
+const SESSIONS_DIR = path.join(STATE_DIR, "agents", "main", "sessions");
 
 function resolveSessionFile(agentId, sessionId) {
   return path.join(STATE_DIR, "agents", agentId, "sessions", `${sessionId}.jsonl`);
+}
+
+/** On message:sent we don't get agentId/sessionId — find the newest session file. */
+async function findNewestSessionFile() {
+  try {
+    const files = (await fsPromises.readdir(SESSIONS_DIR)).filter(f => f.endsWith(".jsonl"));
+    if (files.length === 0) return null;
+    const stats = await Promise.all(
+      files.map(async f => ({ f, mtime: (await fsPromises.stat(path.join(SESSIONS_DIR, f))).mtimeMs }))
+    );
+    stats.sort((a, b) => b.mtime - a.mtime);
+    return path.join(SESSIONS_DIR, stats[0].f);
+  } catch {
+    return null;
+  }
 }
 
 async function readSessionEntries(filePath) {
@@ -138,7 +158,7 @@ function finalizeTurn(turn) {
 
 function resolveSessionMeta(event, entries) {
   const ctx = event.context ?? {};
-  const agentId = ctx.agentId ?? null;
+  const agentId = ctx.agentId ?? "main";
   const sessionId = ctx.sessionId ?? null;
   const sessionKey = event.sessionKey ?? null;
   const channelFromKey = sessionKey
@@ -183,28 +203,37 @@ function buildPayload(sessionMeta, turns, entries) {
 }
 
 function appendLog(filePath, data) {
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
   const sep = "\n" + "=".repeat(80) + "\n";
   fs.appendFileSync(filePath, sep + JSON.stringify(data, null, 2) + "\n");
 }
 
 export default async function HookHandler(event) {
-  const isBootstrap = event.type === "agent" && event.action === "bootstrap";
-  const isCommandNew = event.type === "command" && event.action === "new";
-  if (!isBootstrap && !isCommandNew) return;
+  const isBootstrap   = event.type === "agent"   && event.action === "bootstrap";
+  const isMessageSent = event.type === "message"  && event.action === "sent";
+  if (!isBootstrap && !isMessageSent) return;
 
-  const ctx = event.context ?? {};
-  const agentId = ctx.agentId ?? null;
-  const sessionId = ctx.sessionId ?? null;
-  if (!agentId || !sessionId) return;
+  let sessionFile;
 
-  const sessionFile = resolveSessionFile(agentId, sessionId);
+  if (isBootstrap) {
+    const ctx       = event.context ?? {};
+    const agentId   = ctx.agentId  ?? "main";
+    const sessionId = ctx.sessionId ?? null;
+    if (!sessionId) return;
+    sessionFile = resolveSessionFile(agentId, sessionId);
+  } else {
+    // message:sent — no agentId/sessionId in context, find the newest session file
+    sessionFile = await findNewestSessionFile();
+    if (!sessionFile) return;
+  }
+
   const entries = await readSessionEntries(sessionFile);
   if (entries.length === 0) return;
 
   const turns = extractTurns(entries);
   if (turns.length === 0) return;
 
-  const meta = resolveSessionMeta(event, entries);
+  const meta    = resolveSessionMeta(event, entries);
   const payload = buildPayload(meta, turns, entries);
   appendLog(LOG_FILE, payload);
-};
+}

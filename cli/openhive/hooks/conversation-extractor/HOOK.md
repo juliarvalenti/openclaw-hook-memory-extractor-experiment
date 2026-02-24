@@ -6,9 +6,9 @@ metadata:
     emoji: "🔍"
     events:
       - agent:bootstrap
-      - command:new
+      - message:sent
 ---
 
-Reads the session JSONL at bootstrap time and emits a structured `openclaw-conversation-v1` payload.
+Reads the session JSONL after each agent response and emits a structured `openclaw-conversation-v1` payload.
 
-Output: `~/.openclaw/conversation-extractor.log`
+Output: `$OPENCLAW_EXTRACTOR_OUTPUT/conversation-extractor.log` (falls back to `~/.openclaw/`)
