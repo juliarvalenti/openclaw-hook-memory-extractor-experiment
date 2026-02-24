@@ -202,6 +202,12 @@ scaffold_agent() {
   # openclaw.json — copy from template
   cp "${template_agent_dir}/openclaw.json" "${agent_dir}/openclaw.json"
 
+  # Base skills — auto-install into every agent
+  local base_skills_dir="${EXPERIMENTS_DIR}/_base-skills"
+  if [[ -d "${base_skills_dir}" ]]; then
+    cp -r "${base_skills_dir}/." "${agent_dir}/workspace/skills/"
+  fi
+
   # IDENTITY.md — pre-fill with agent name
   cat > "${agent_dir}/workspace/IDENTITY.md" << EOF
 # Identity
