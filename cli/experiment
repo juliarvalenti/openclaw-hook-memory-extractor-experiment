@@ -463,7 +463,7 @@ cmd_run() {
   timestamp=$(date +%s)
   local run_dir="${exp_dir}/runs/${timestamp}"
   local room_alias
-  room_alias=$(room_alias_for "$name")
+  room_alias=$(room_alias_for "${name}-${timestamp}")
   local homeserver="http://localhost:8008"
 
   echo "==> Starting experiment '${name}' (run: ${timestamp})"
@@ -762,7 +762,7 @@ cmd_messages() {
   run_dir=$(active_run_dir "$exp_dir") || die "No runs found for '${name}'"
 
   local room_alias
-  room_alias=$(room_alias_for "$name")
+  room_alias=$(room_alias_for "${name}-$(basename "$run_dir")")
   local encoded_alias
   encoded_alias=$(url_encode_room_alias "$room_alias")
 
@@ -803,7 +803,7 @@ cmd_watch() {
   run_dir=$(active_run_dir "$exp_dir") || die "No runs found for '${name}'"
 
   local room_alias
-  room_alias=$(room_alias_for "$name")
+  room_alias=$(room_alias_for "${name}-$(basename "$run_dir")")
 
   local observer_pass
   observer_pass=$(grep OBSERVER_MATRIX_PASSWORD "${run_dir}/.env" | cut -d= -f2)
@@ -824,7 +824,7 @@ cmd_status() {
 
   echo "Experiment: ${name}"
   echo "Run:        $(basename "${run_dir}")"
-  echo "Room:       $(room_alias_for "$name")"
+  echo "Room:       $(room_alias_for "${name}-$(basename "$run_dir")")"
   echo ""
   (cd "${run_dir}" && docker compose ps)
 }
