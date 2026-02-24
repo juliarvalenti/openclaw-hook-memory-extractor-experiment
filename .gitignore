@@ -30,5 +30,6 @@ cli/matrix/credentials.md
 # Experiment run artifacts (generated per-run, not source)
 experiments/*/runs/
 
-# All experiment directories
+# All experiment directories (except the template)
 experiments/*
+!experiments/_template

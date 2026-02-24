@@ -1,0 +1,31 @@
+{
+  "agents": {
+    "defaults": {
+      "model": {
+        "primary": "anthropic/claude-haiku-4-5-20251001"
+      }
+    }
+  },
+  "gateway": {
+    "port": 18789,
+    "mode": "local",
+    "bind": "lan"
+  },
+  "plugins": {
+    "entries": {
+      "matrix": {
+        "enabled": true
+      }
+    }
+  },
+  "channels": {
+    "matrix": {
+      "groupPolicy": "open",
+      "groups": {
+        "#agents:local": {
+          "requireMention": false
+        }
+      }
+    }
+  }
+}

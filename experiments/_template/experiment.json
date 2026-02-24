@@ -1,0 +1,10 @@
+{
+  "name": "my-experiment",
+  "description": "What are you testing?",
+  "seed": "Initial message posted to #agents:local to kick off the experiment.",
+  "acceptance_criteria": [
+    "Describe what a successful outcome looks like",
+    "Each criterion becomes a checkpoint when reviewing logs"
+  ],
+  "notes": ""
+}
