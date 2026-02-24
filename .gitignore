@@ -15,3 +15,20 @@ docker/configs/*/update-check.json
 
 # ngircd/ergo configs (replaced by Matrix)
 docker/ngircd/
+
+# CLI build artifacts and secrets
+cli/node_modules/
+cli/openhive/node_modules/
+cli/dist/
+cli/.env
+
+# Shared Matrix homeserver data (signing keys, database, media) and secrets
+cli/matrix/data/
+cli/matrix/observer.env
+cli/matrix/credentials.md
+
+# Experiment run artifacts (generated per-run, not source)
+experiments/*/runs/
+
+# All experiment directories
+experiments/*

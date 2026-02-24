@@ -1,0 +1,843 @@
+#!/usr/bin/env bash
+# experiment — CLI for creating and running multi-agent experiments.
+#
+# Usage:
+#   experiment matrix start             Start the shared Matrix homeserver
+#   experiment matrix stop              Stop the shared Matrix homeserver
+#   experiment matrix reset             Wipe data and restart fresh
+#   experiment matrix status            Show status + observer credentials
+#
+#   experiment create <name> [agents…]  Scaffold a new experiment from _template
+#   experiment run    <name>            Start a timestamped run of an experiment
+#   experiment stop   <name>            Stop the active run
+#   experiment logs   <name> [agent] [--follow]  Tail run logs
+#   experiment watch  <name>            Stream the experiment room to terminal
+#   experiment messages <name> [limit]  Snapshot recent room messages
+#   experiment list                     List all experiments and their run history
+#   experiment status <name>            Show active run status
+#
+# Prerequisites:
+#   - Docker with Compose v2
+#   - Node.js + npm (for tsx / generate-compose.ts)
+#   - ANTHROPIC_API_KEY (or equivalent) in environment or cli/.env
+#   - openclaw-agents:local Docker image built
+#   - Run `npm install` in cli/ before first use
+#   - Shared Matrix server running: experiment matrix start
+
+set -euo pipefail
+
+# ── Paths ─────────────────────────────────────────────────────────────────────
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+EXPERIMENTS_DIR="${REPO_ROOT}/experiments"
+TEMPLATE_DIR="${EXPERIMENTS_DIR}/_template"
+GENERATE_COMPOSE="${SCRIPT_DIR}/src/generate-compose.ts"
+MATRIX_DIR="${SCRIPT_DIR}/matrix"
+
+# Load .env if present (API keys, Bedrock config, etc.)
+if [[ -f "${SCRIPT_DIR}/.env" ]]; then
+  # shellcheck disable=SC1091
+  set -o allexport; source "${SCRIPT_DIR}/.env"; set +o allexport
+fi
+
+# Ensure cli deps are installed
+if [[ ! -d "${SCRIPT_DIR}/node_modules" ]]; then
+  echo "==> Installing cli dependencies..."
+  (cd "${SCRIPT_DIR}" && npm install --silent)
+fi
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+usage() {
+  grep '^#' "$0" | grep -v '#!/' | sed 's/^# \{0,1\}//'
+  exit 0
+}
+
+die() { echo "Error: $*" >&2; exit 1; }
+
+# agent_env_prefix city-selector  →  CITY_SELECTOR
+agent_env_prefix() {
+  echo "$1" | tr '[:lower:]' '[:upper:]' | tr '-' '_'
+}
+
+require_experiment() {
+  local name="$1"
+  [[ -n "$name" ]] || die "Experiment name required."
+  local dir="${EXPERIMENTS_DIR}/${name}"
+  [[ -d "$dir" ]] || die "Experiment '${name}' not found at ${dir}"
+  echo "$dir"
+}
+
+active_run_dir() {
+  local exp_dir="$1"
+  local runs_dir="${exp_dir}/runs"
+  [[ -d "$runs_dir" ]] || return 1
+  local latest
+  latest=$(ls -1 "${runs_dir}" 2>/dev/null | sort | tail -1)
+  [[ -n "$latest" ]] || return 1
+  echo "${runs_dir}/${latest}"
+}
+
+# room_alias_for <experiment-slug>  →  #trip-planner-s1-20260223T185939Z:local
+room_alias_for() {
+  echo "#${1}:local"
+}
+
+# url_encode_room_alias "#foo:local"  →  %23foo%3Alocal
+url_encode_room_alias() {
+  echo "$1" | sed 's/#/%23/g' | sed 's/:/%3A/g'
+}
+
+matrix_token() {
+  local homeserver="$1" user="$2" pass="$3"
+  curl -sf \
+    -X POST "${homeserver}/_matrix/client/r0/login" \
+    -H "Content-Type: application/json" \
+    -d "{\"type\":\"m.login.password\",\"user\":\"${user}\",\"password\":\"${pass}\"}" \
+    | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{ try { process.stdout.write(JSON.parse(d).access_token||''); } catch(e){} })" \
+    2>/dev/null || true
+}
+
+post_seed_message() {
+  local homeserver="$1"
+  local run_dir="$2"
+  local exp_dir="$3"
+  local room_alias="$4"
+
+  local seed
+  seed=$(node -e "
+    const d = require('${exp_dir}/experiment.json');
+    process.stdout.write(d.seed || '');
+  " 2>/dev/null || true)
+
+  [[ -z "$seed" ]] && return 0
+
+  local observer_pass
+  observer_pass=$(grep OBSERVER_MATRIX_PASSWORD "${run_dir}/.env" | cut -d= -f2 || echo "observer123")
+
+  local token=""
+  for i in $(seq 1 20); do
+    token=$(matrix_token "$homeserver" "observer" "$observer_pass")
+    [[ -n "$token" ]] && break
+    sleep 2
+  done
+
+  [[ -z "$token" ]] && { echo "    (Could not get Matrix token — seed not posted.)" ; return 0; }
+
+  local encoded_alias
+  encoded_alias=$(url_encode_room_alias "$room_alias")
+
+  local room_id
+  room_id=$(curl -sf \
+    "${homeserver}/_matrix/client/r0/directory/room/${encoded_alias}" \
+    -H "Authorization: Bearer ${token}" \
+    | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{ try { process.stdout.write(JSON.parse(d).room_id||''); } catch(e){} })" \
+    2>/dev/null || true)
+
+  [[ -z "$room_id" ]] && { echo "    (Could not resolve room ID — seed not posted.)" ; return 0; }
+
+  # Poll until all agents have connected to Matrix (not just force-joined).
+  # Force-join sets membership instantly server-side, but we need to wait until
+  # each agent has actually booted, connected, and done a Matrix sync.
+  # /_synapse/admin/v1/whois/{userId} only shows connections after a real sync.
+  local expected_count=${#agent_names[@]}
+  local ready_count=0
+  echo "==> Waiting for agents to connect..."
+  for i in $(seq 1 60); do
+    ready_count=0
+    for agent in "${agent_names[@]}"; do
+      local matrix_user="@${agent}-${timestamp}:local"
+      local connections
+      connections=$(curl -sf \
+        "${homeserver}/_synapse/admin/v1/whois/${matrix_user}" \
+        -H "Authorization: Bearer ${token}" \
+        | node -e "
+          let d='';
+          process.stdin.on('data',c=>d+=c).on('end',()=>{
+            try {
+              const u = JSON.parse(d);
+              const devices = Object.values(u.devices || {});
+              const hasConn = devices.some(dev =>
+                (dev.sessions||[]).some(s => (s.connections||[]).length > 0)
+              );
+              process.stdout.write(hasConn ? '1' : '0');
+            } catch(e) { process.stdout.write('0'); }
+          })
+        " 2>/dev/null || echo "0")
+      [[ "$connections" == "1" ]] && (( ready_count++ )) || true
+    done
+    if [[ "$ready_count" -ge "$expected_count" ]]; then
+      echo "    All ${expected_count} agents connected."
+      break
+    fi
+    echo -n "    Waiting (${ready_count}/${expected_count} connected)..."$'\r'
+    sleep 2
+    if [[ "$i" -eq 60 ]]; then
+      echo "    Timeout waiting for agents — posting seed anyway."
+    fi
+  done
+
+  echo "==> Posting seed message to ${room_alias}..."
+
+  local txn_id="exp-seed-$(date +%s)"
+  curl -sf \
+    -X PUT "${homeserver}/_matrix/client/r0/rooms/${room_id}/send/m.room.message/${txn_id}" \
+    -H "Authorization: Bearer ${token}" \
+    -H "Content-Type: application/json" \
+    -d "{\"msgtype\":\"m.text\",\"body\":\"${seed}\"}" > /dev/null
+
+  echo "    Seed posted."
+}
+
+# ── Commands ──────────────────────────────────────────────────────────────────
+
+scaffold_agent() {
+  local agent_dir="$1"
+  local agent_name="$2"
+  local template_agent_dir="${TEMPLATE_DIR}/agents/agent-example"
+
+  mkdir -p "${agent_dir}/workspace/skills" "${agent_dir}/workspace/hooks"
+
+  # openclaw.json — copy from template
+  cp "${template_agent_dir}/openclaw.json" "${agent_dir}/openclaw.json"
+
+  # IDENTITY.md — pre-fill with agent name
+  cat > "${agent_dir}/workspace/IDENTITY.md" << EOF
+# Identity
+
+- **Name:** ${agent_name}
+- **Role:** _(describe this agent's job in the experiment)_
+- **Vibe:** _(how does it communicate? concise? analytical? cautious?)_
+- **Emoji:** _(pick one)_
+EOF
+
+  # SOUL.md — behavioral defaults
+  cat > "${agent_dir}/workspace/SOUL.md" << 'EOF'
+# Soul
+
+**Be genuinely helpful, not performatively helpful.** Skip filler phrases — just act.
+
+**Have opinions.** You're allowed to disagree, flag uncertainty, or push back.
+
+**Be resourceful before asking.** Try to figure it out first. Then ask if stuck.
+
+**Stay in your lane.** Focus on your assigned role. Delegate clearly when handing off.
+
+**Be concise in group chat.** This is a working room, not a presentation. One clear
+message beats three hedged ones.
+
+**Earn trust through competence.** Other agents and the observer are watching. Be careful
+with external actions. Be bold with analysis and reasoning.
+EOF
+
+  # CONSTRAINTS.md — empty by default, comments explain usage
+  cat > "${agent_dir}/workspace/CONSTRAINTS.md" << 'EOF'
+# Constraints
+
+<!--
+Uncomment and edit to add artificial limitations for failure-mode experiments.
+
+Examples:
+- "You may only respond with bullet points. Maximum 2 bullets per message."
+- "You must not ask other agents for clarification. Work only with what you have."
+- "You are not allowed to view raw logs. Summaries only."
+- "You must treat all cost figures as USD, regardless of what other agents say."
+
+Leave this file empty (no active constraints) for baseline / control runs.
+-->
+EOF
+}
+
+cmd_matrix() {
+  local subcmd="${1:-status}"
+  shift || true
+
+  case "$subcmd" in
+    start)
+      echo "==> Initializing shared Matrix homeserver..."
+
+      # Generate Synapse config if not already present
+      if [[ ! -f "${MATRIX_DIR}/data/homeserver.yaml" ]]; then
+        echo "    Generating homeserver config..."
+        docker compose -f "${MATRIX_DIR}/docker-compose.yml" run --rm \
+          -e SYNAPSE_SERVER_NAME=local \
+          -e SYNAPSE_REPORT_STATS=no \
+          matrix generate 2>/dev/null
+
+        # Append registration + rate limit settings
+        cat >> "${MATRIX_DIR}/data/homeserver.yaml" << 'EOF'
+
+# ── OpenClaw experiment additions ─────────────────────────────────────────────
+enable_registration: true
+enable_registration_without_verification: true
+registration_shared_secret: "poc-local-secret"
+
+# Disable rate limiting — agents retry aggressively and hammer the login endpoint
+rc_login:
+  address:    { per_second: 10000, burst_count: 10000 }
+  account:    { per_second: 10000, burst_count: 10000 }
+  failed_attempts: { per_second: 10000, burst_count: 10000 }
+rc_message_sending:
+  per_second: 10000
+  burst_count: 10000
+EOF
+      fi
+
+      echo "==> Starting shared Matrix homeserver..."
+      docker compose -f "${MATRIX_DIR}/docker-compose.yml" up -d
+
+      echo -n "==> Waiting for Matrix"
+      for i in $(seq 1 30); do
+        if curl -sf http://localhost:8008/health > /dev/null 2>&1; then
+          echo " ready"
+          break
+        fi
+        echo -n "."
+        sleep 2
+        if [[ "$i" -eq 30 ]]; then
+          echo ""
+          die "Matrix did not become healthy. Check: docker compose -f cli/matrix/docker-compose.yml logs"
+        fi
+      done
+
+      # Generate and persist observer credentials (shared across all experiments)
+      if [[ ! -f "${MATRIX_DIR}/observer.env" ]]; then
+        local obs_pass
+        obs_pass=$(openssl rand -hex 16)
+        echo "OBSERVER_MATRIX_PASSWORD=${obs_pass}" > "${MATRIX_DIR}/observer.env"
+        echo "    Generated observer credentials"
+
+        # Wait briefly then register observer
+        sleep 2
+        docker exec openclaw-matrix register_new_matrix_user \
+          --admin -u observer -p "$obs_pass" \
+          -c /data/homeserver.yaml \
+          http://localhost:8008 2>&1 | grep -v "^$" || true
+        echo "    @observer:local registered (admin)"
+      else
+        echo "    Observer credentials exist"
+      fi
+
+      echo ""
+      echo "Matrix running at http://localhost:8008"
+      # shellcheck disable=SC1091
+      source "${MATRIX_DIR}/observer.env"
+      echo "Observer:  @observer:local / ${OBSERVER_MATRIX_PASSWORD}"
+      echo "Network:   openclaw-matrix (experiments attach to this)"
+
+      # Write credentials file for easy access
+      cat > "${MATRIX_DIR}/credentials.md" <<EOF
+# Matrix Credentials
+
+Homeserver: http://localhost:8008
+Username:   @observer:local
+Password:   ${OBSERVER_MATRIX_PASSWORD}
+EOF
+      echo "Credentials: cli/matrix/credentials.md"
+      ;;
+
+    stop)
+      echo "==> Stopping shared Matrix homeserver..."
+      docker compose -f "${MATRIX_DIR}/docker-compose.yml" down
+      echo "==> Stopped."
+      ;;
+
+    reset)
+      echo "==> Resetting shared Matrix homeserver (wipes all data)..."
+      docker compose -f "${MATRIX_DIR}/docker-compose.yml" down -v 2>/dev/null || true
+      rm -rf "${MATRIX_DIR}/data" "${MATRIX_DIR}/observer.env"
+      mkdir -p "${MATRIX_DIR}/data"
+      touch "${MATRIX_DIR}/data/.gitkeep"
+      echo "==> Reset complete. Run: experiment matrix start"
+      ;;
+
+    status)
+      docker compose -f "${MATRIX_DIR}/docker-compose.yml" ps
+      if [[ -f "${MATRIX_DIR}/observer.env" ]]; then
+        echo ""
+        echo "Observer credentials:"
+        # shellcheck disable=SC1091
+        source "${MATRIX_DIR}/observer.env"
+        echo "  Homeserver: http://localhost:8008"
+        echo "  Username:   @observer:local"
+        echo "  Password:   ${OBSERVER_MATRIX_PASSWORD}"
+      fi
+      ;;
+
+    *)
+      die "Unknown matrix subcommand '${subcmd}'. Use: start, stop, status"
+      ;;
+  esac
+}
+
+cmd_create() {
+  local name="${1:-}"
+  [[ -n "$name" ]] || die "Usage: experiment create <name> [agent1] [agent2] ..."
+  [[ ! "$name" =~ ^_ ]] || die "Experiment names cannot start with _"
+  shift
+
+  local agent_names=("$@")
+  [[ ${#agent_names[@]} -gt 0 ]] || agent_names=("agent-1")
+
+  local timestamp
+  timestamp=$(date +%s)
+  local slug="${name}-${timestamp}"
+  local dest="${EXPERIMENTS_DIR}/${slug}"
+
+  echo "==> Creating experiment '${slug}'..."
+  mkdir -p "${dest}/agents"
+
+  cp "${TEMPLATE_DIR}/experiment.json" "${dest}/experiment.json"
+
+  for agent in "${agent_names[@]}"; do
+    echo "    agent: ${agent}"
+    scaffold_agent "${dest}/agents/${agent}" "${agent}"
+  done
+
+  local agents_json
+  agents_json=$(printf '"%s",' "${agent_names[@]}")
+  agents_json="[${agents_json%,}]"
+
+  node -e "
+    const fs = require('fs');
+    const p = '${dest}/experiment.json';
+    const d = JSON.parse(fs.readFileSync(p, 'utf8'));
+    d.name = '${name}';
+    d.created_at = '${timestamp}';
+    d.agents = ${agents_json};
+    fs.writeFileSync(p, JSON.stringify(d, null, 2) + '\n');
+  "
+
+  echo ""
+  echo "Created: ${dest}"
+  echo ""
+  echo "Next steps:"
+  echo "  1. Edit ${dest}/experiment.json      — set seed + acceptance_criteria"
+  echo "  2. Edit each agent's IDENTITY.md     — describe their role"
+  echo "  3. Edit each agent's CONSTRAINTS.md  — add limitations if needed"
+  echo "  4. Edit each agent's openclaw.json   — change model if needed"
+  echo "  5. Run: experiment run ${slug}"
+}
+
+cmd_run() {
+  local name="${1:-}"
+  local exp_dir
+  exp_dir=$(require_experiment "$name")
+
+  # ── Stop any previous run ────────────────────────────────────────────────
+  local prev_run_dir
+  if prev_run_dir=$(active_run_dir "$exp_dir" 2>/dev/null); then
+    echo "==> Stopping previous run: $(basename "${prev_run_dir}")..."
+    (cd "${prev_run_dir}" && docker compose down 2>/dev/null) || true
+  fi
+
+  # ── Require Matrix to be running ─────────────────────────────────────────
+  if ! curl -sf http://localhost:8008/health > /dev/null 2>&1; then
+    die "Shared Matrix server is not running. Start it first: experiment matrix start"
+  fi
+
+  # ── Require an API key ────────────────────────────────────────────────────
+  local api_key_var=""
+  local api_key_val=""
+  if [[ -n "${ANTHROPIC_API_KEY:-}" ]]; then
+    api_key_var="ANTHROPIC_API_KEY"; api_key_val="${ANTHROPIC_API_KEY}"
+  elif [[ -n "${OPENAI_API_KEY:-}" ]]; then
+    api_key_var="OPENAI_API_KEY"; api_key_val="${OPENAI_API_KEY}"
+  elif [[ -n "${GEMINI_API_KEY:-}" ]]; then
+    api_key_var="GEMINI_API_KEY"; api_key_val="${GEMINI_API_KEY}"
+  elif [[ -n "${OPENROUTER_API_KEY:-}" ]]; then
+    api_key_var="OPENROUTER_API_KEY"; api_key_val="${OPENROUTER_API_KEY}"
+  else
+    die "No LLM API key found. Set one of: ANTHROPIC_API_KEY, OPENAI_API_KEY, GEMINI_API_KEY, OPENROUTER_API_KEY"
+  fi
+  echo "==> Using ${api_key_var}"
+
+  local timestamp
+  timestamp=$(date +%s)
+  local run_dir="${exp_dir}/runs/${timestamp}"
+  local room_alias
+  room_alias=$(room_alias_for "$name")
+  local homeserver="http://localhost:8008"
+
+  echo "==> Starting experiment '${name}' (run: ${timestamp})"
+  echo "    Room: ${room_alias}"
+
+  # ── Collect agent names ──────────────────────────────────────────────────
+  local agents_dir="${exp_dir}/agents"
+  [[ -d "$agents_dir" ]] || die "No agents/ directory in ${exp_dir}"
+
+  agent_names=()
+  while IFS= read -r line; do agent_names+=("$line"); done < <(ls -1 "${agents_dir}")
+  [[ ${#agent_names[@]} -gt 0 ]] || die "No agents found in ${agents_dir}"
+
+  echo "==> Agents: ${agent_names[*]}"
+
+  # ── Clear stale Matrix credentials ───────────────────────────────────────
+  # Wipe credentials so agents re-authenticate against the shared server.
+  # Tokens from a previous Synapse instance cause M_UNKNOWN_TOKEN errors.
+  for agent in "${agent_names[@]}"; do
+    rm -rf "${agents_dir}/${agent}/credentials"
+    rm -rf "${agents_dir}/${agent}/matrix"
+  done
+
+  # ── Create run directory structure ───────────────────────────────────────
+  mkdir -p "${run_dir}"
+  for agent in "${agent_names[@]}"; do
+    mkdir -p "${run_dir}/logs/${agent}"
+  done
+
+  # ── Load shared observer credentials ────────────────────────────────────
+  local observer_env="${MATRIX_DIR}/observer.env"
+  [[ -f "$observer_env" ]] || die "Observer credentials not found. Run: experiment matrix start"
+  # shellcheck disable=SC1091
+  source "$observer_env"
+
+  # ── Generate .env ─────────────────────────────────────────────────────────
+  echo "==> Generating .env..."
+  {
+    echo "${api_key_var}=${api_key_val}"
+    [[ -n "${ANTHROPIC_BASE_URL:-}" ]]    && echo "ANTHROPIC_BASE_URL=${ANTHROPIC_BASE_URL}"
+    [[ -n "${AWS_ACCESS_KEY_ID:-}" ]]     && echo "AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}"
+    [[ -n "${AWS_SECRET_ACCESS_KEY:-}" ]] && echo "AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}"
+    [[ -n "${AWS_REGION:-}" ]]            && echo "AWS_REGION=${AWS_REGION}"
+    [[ -n "${AWS_SESSION_TOKEN:-}" ]]     && echo "AWS_SESSION_TOKEN=${AWS_SESSION_TOKEN}"
+    echo ""
+    echo "OPENCLAW_IMAGE=\${OPENCLAW_IMAGE:-openclaw-agents:local}"
+    echo ""
+    echo "# Gateway tokens (auto-generated per run)"
+    for agent in "${agent_names[@]}"; do
+      echo "AGENT_$(agent_env_prefix "$agent")_TOKEN=$(openssl rand -hex 24)"
+    done
+    echo ""
+    echo "# Matrix passwords (auto-generated per run)"
+    for agent in "${agent_names[@]}"; do
+      echo "AGENT_$(agent_env_prefix "$agent")_MATRIX_PASSWORD=$(openssl rand -hex 16)"
+    done
+    echo ""
+    echo "# Observer — shared across all experiments on this Matrix server"
+    echo "OBSERVER_MATRIX_PASSWORD=${OBSERVER_MATRIX_PASSWORD}"
+  } > "${run_dir}/.env"
+
+  # ── Generate docker-compose.yml ───────────────────────────────────────────
+  echo "==> Generating docker-compose.yml..."
+  (cd "${SCRIPT_DIR}" && npx tsx "${GENERATE_COMPOSE}" "${exp_dir}" "${run_dir}" "${room_alias}" "${timestamp}") \
+    > "${run_dir}/docker-compose.yml"
+
+  # ── Copy Dockerfile into run dir (compose build context) ─────────────────
+  local dockerfile_src="${REPO_ROOT}/docker/Dockerfile"
+  if [[ -f "$dockerfile_src" ]]; then
+    cp "$dockerfile_src" "${run_dir}/Dockerfile"
+  fi
+
+  # ── Register Matrix users ─────────────────────────────────────────────────
+  echo "==> Registering Matrix users..."
+  # shellcheck disable=SC1091
+  source "${run_dir}/.env"
+
+  # Run-scoped usernames: @city-selector-20260223T203112Z:local
+  # Always a fresh user — no "already exists" possible.
+  register_agent() {
+    local matrix_user="${1}-${timestamp}"
+    local pass="$2"
+    echo -n "    @${matrix_user}:local "
+    local out
+    out=$(docker exec openclaw-matrix register_new_matrix_user \
+      --no-admin -u "$matrix_user" -p "$pass" \
+      -c /data/homeserver.yaml \
+      http://localhost:8008 2>&1 || true)
+    if echo "$out" | grep -qi "success"; then
+      echo "(registered)"
+    else
+      echo "— $out"
+    fi
+  }
+
+  for agent in "${agent_names[@]}"; do
+    local pw_var="AGENT_$(agent_env_prefix "$agent")_MATRIX_PASSWORD"
+    register_agent "$agent" "${!pw_var}"
+  done
+  # Observer is stable — skip re-registration (already done at matrix start)
+
+  # ── Create the experiment room ─────────────────────────────────────────────
+  echo "==> Setting up room ${room_alias}..."
+  local obs_token
+  obs_token=$(matrix_token "$homeserver" "observer" "${OBSERVER_MATRIX_PASSWORD}")
+
+  if [[ -z "$obs_token" ]]; then
+    echo "    (Could not get observer token — room setup skipped)"
+  else
+    local encoded_alias
+    encoded_alias=$(url_encode_room_alias "$room_alias")
+
+    # Check if room already exists
+    local existing_room_id
+    existing_room_id=$(curl -sf \
+      "${homeserver}/_matrix/client/r0/directory/room/${encoded_alias}" \
+      -H "Authorization: Bearer ${obs_token}" \
+      | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{ try { process.stdout.write(JSON.parse(d).room_id||''); } catch(e){} })" \
+      2>/dev/null || true)
+
+    if [[ -z "$existing_room_id" ]]; then
+      # Create the room with the alias
+      local room_name="${name}"
+      curl -sf -X POST "${homeserver}/_matrix/client/r0/createRoom" \
+        -H "Authorization: Bearer ${obs_token}" \
+        -H "Content-Type: application/json" \
+        -d "{
+          \"room_alias_name\": \"${name}\",
+          \"name\": \"${room_name}\",
+          \"preset\": \"public_chat\",
+          \"visibility\": \"public\"
+        }" > /dev/null
+      echo "    Room created: ${room_alias}"
+    else
+      echo "    Room exists: ${room_alias}"
+    fi
+  fi
+
+  # ── Install OpenHive hooks into each agent workspace ─────────────────────
+  echo "==> Configuring agents (openhive)..."
+  local openhive_tsx="${SCRIPT_DIR}/openhive/node_modules/.bin/tsx"
+  local openhive_src="${SCRIPT_DIR}/openhive/src/index.ts"
+  for agent in "${agent_names[@]}"; do
+    local workspace="${agents_dir}/${agent}/workspace"
+    if "${openhive_tsx}" "${openhive_src}" agent configure openclaw --workspace "${workspace}" 2>/dev/null; then
+      echo "    ${agent}: IOC hook installed"
+    else
+      echo "    ${agent}: openhive not available, skipping"
+    fi
+  done
+
+  # ── Start agents ──────────────────────────────────────────────────────────
+  echo "==> Starting agents..."
+  (cd "${run_dir}" && docker compose up -d "${agent_names[@]}")
+
+  # ── Force-join agents into the room (no invite event = no pairing prompt) ─
+  # Wait for agents to log in, then use the Synapse admin API to join them
+  # directly. This avoids the OpenClaw pairing flow that client invites trigger.
+  if [[ -n "$obs_token" && -n "$existing_room_id" ]]; then
+    local room_id_for_join="$existing_room_id"
+  elif [[ -n "$obs_token" ]]; then
+    room_id_for_join=$(curl -sf \
+      "${homeserver}/_matrix/client/r0/directory/room/${encoded_alias}" \
+      -H "Authorization: Bearer ${obs_token}" \
+      | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{ try { process.stdout.write(JSON.parse(d).room_id||''); } catch(e){} })" \
+      2>/dev/null || true)
+  fi
+
+  if [[ -n "$obs_token" && -n "${room_id_for_join:-}" ]]; then
+    echo "==> Force-joining agents into room..."
+    # Brief pause for agents to register their Matrix session
+    sleep 3
+    for agent in "${agent_names[@]}"; do
+      local matrix_user="@${agent}-${timestamp}:local"
+      # Synapse admin force-join: POST /_synapse/admin/v1/join/{roomId}
+      local result
+      result=$(curl -sf -X POST \
+        "${homeserver}/_synapse/admin/v1/join/${room_id_for_join}" \
+        -H "Authorization: Bearer ${obs_token}" \
+        -H "Content-Type: application/json" \
+        -d "{\"user_id\":\"${matrix_user}\"}" 2>/dev/null || true)
+      if echo "$result" | grep -q "room_id"; then
+        echo "    ${matrix_user} joined"
+      else
+        echo "    ${matrix_user}: ${result}"
+      fi
+    done
+  fi
+
+  # ── Post seed message ─────────────────────────────────────────────────────
+  post_seed_message "$homeserver" "${run_dir}" "${exp_dir}" "${room_alias}"
+
+  # ── Done ──────────────────────────────────────────────────────────────────
+  local observer_pass
+  observer_pass=$(grep OBSERVER_MATRIX_PASSWORD "${run_dir}/.env" | cut -d= -f2)
+
+  echo ""
+  echo "==> Run active: ${run_dir}"
+  echo ""
+  echo "    Matrix:"
+  echo "      Homeserver: http://localhost:8008"
+  echo "      Username:   @observer:local"
+  echo "      Password:   ${observer_pass}"
+  echo "      Room:       ${room_alias}"
+  echo ""
+  echo "    Logs:"
+  echo "      experiment logs ${name}"
+  echo "      experiment logs ${name} ${agent_names[0]}"
+  echo ""
+  echo "    Stop:"
+  echo "      experiment stop ${name}"
+}
+
+cmd_stop() {
+  local name="${1:-}"
+  local exp_dir
+  exp_dir=$(require_experiment "$name")
+
+  local run_dir
+  run_dir=$(active_run_dir "$exp_dir") || die "No runs found for '${name}'"
+
+  echo "==> Stopping run: $(basename "${run_dir}")"
+  (cd "${run_dir}" && docker compose down)
+  echo "==> Stopped."
+}
+
+cmd_logs() {
+  local name="${1:-}"
+  local agent="${2:-}"
+  local follow=false
+  for arg in "$@"; do [[ "$arg" == "--follow" || "$arg" == "-f" ]] && follow=true; done
+
+  local exp_dir
+  exp_dir=$(require_experiment "$name")
+
+  local run_dir
+  run_dir=$(active_run_dir "$exp_dir") || die "No runs found for '${name}'"
+
+  local logs_dir="${run_dir}/logs"
+
+  if [[ -n "$agent" && "$agent" != "--follow" && "$agent" != "-f" ]]; then
+    local agent_log_dir="${logs_dir}/${agent}"
+    [[ -d "$agent_log_dir" ]] || die "No logs for agent '${agent}' in this run"
+    if $follow; then
+      tail -f "${agent_log_dir}"/*.jsonl 2>/dev/null || echo "(no log files yet)"
+    else
+      ls -lh "${agent_log_dir}"
+    fi
+  else
+    if $follow; then
+      (cd "${run_dir}" && docker compose logs -f)
+    else
+      (cd "${run_dir}" && docker compose logs --tail=50)
+    fi
+  fi
+}
+
+cmd_list() {
+  echo "Experiments:"
+  echo ""
+  for dir in "${EXPERIMENTS_DIR}"/*/; do
+    local name
+    name=$(basename "$dir")
+    [[ "$name" == "_template" ]] && continue
+
+    local desc=""
+    if [[ -f "${dir}/experiment.json" ]]; then
+      desc=$(node -e "
+        const d = require('${dir}/experiment.json');
+        process.stdout.write(d.description || '');
+      " 2>/dev/null || true)
+    fi
+
+    local run_count=0
+    local latest=""
+    if [[ -d "${dir}/runs" ]]; then
+      run_count=$(ls -1 "${dir}/runs" 2>/dev/null | wc -l | tr -d ' ')
+      latest=$(ls -1 "${dir}/runs" 2>/dev/null | sort | tail -1)
+    fi
+
+    printf "  %-45s %s\n" "${name}" "${desc}"
+    if [[ $run_count -gt 0 ]]; then
+      printf "  %-45s runs: %s  latest: %s\n" "" "${run_count}" "${latest}"
+    fi
+    echo ""
+  done
+}
+
+cmd_messages() {
+  local name="${1:-}"
+  local limit="${2:-100}"
+  local exp_dir
+  exp_dir=$(require_experiment "$name")
+
+  local run_dir
+  run_dir=$(active_run_dir "$exp_dir") || die "No runs found for '${name}'"
+
+  local room_alias
+  room_alias=$(room_alias_for "$name")
+  local encoded_alias
+  encoded_alias=$(url_encode_room_alias "$room_alias")
+
+  local observer_pass
+  observer_pass=$(grep OBSERVER_MATRIX_PASSWORD "${run_dir}/.env" | cut -d= -f2)
+
+  local token
+  token=$(matrix_token "http://localhost:8008" "observer" "$observer_pass")
+
+  local room_id
+  room_id=$(curl -sf "http://localhost:8008/_matrix/client/r0/directory/room/${encoded_alias}" \
+    -H "Authorization: Bearer ${token}" \
+    | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>console.log(JSON.parse(d).room_id))")
+
+  curl -sf "http://localhost:8008/_matrix/client/r0/rooms/${room_id}/messages?limit=${limit}&dir=b" \
+    -H "Authorization: Bearer ${token}" \
+    | node -e "
+      let d='';
+      process.stdin.on('data',c=>d+=c).on('end',()=>{
+        JSON.parse(d).chunk
+          .filter(m => m.type === 'm.room.message')
+          .reverse()
+          .forEach(m => {
+            const name = m.sender.replace('@','').replace(':local','').replace(/-\d{10}$/,'');
+            const time = new Date(m.origin_server_ts).toISOString().slice(11,19);
+            console.log(time + '  ' + name + ': ' + m.content.body);
+            console.log();
+          });
+      })"
+}
+
+cmd_watch() {
+  local name="${1:-}"
+  local exp_dir
+  exp_dir=$(require_experiment "$name")
+
+  local run_dir
+  run_dir=$(active_run_dir "$exp_dir") || die "No runs found for '${name}'"
+
+  local room_alias
+  room_alias=$(room_alias_for "$name")
+
+  local observer_pass
+  observer_pass=$(grep OBSERVER_MATRIX_PASSWORD "${run_dir}/.env" | cut -d= -f2)
+  [[ -n "$observer_pass" ]] || die "Could not read OBSERVER_MATRIX_PASSWORD from ${run_dir}/.env"
+
+  echo "Watching ${room_alias} — Ctrl+C to stop"
+  echo ""
+  (cd "${SCRIPT_DIR}" && npx tsx src/watch-room.ts "http://localhost:8008" "${observer_pass}" "${room_alias}")
+}
+
+cmd_status() {
+  local name="${1:-}"
+  local exp_dir
+  exp_dir=$(require_experiment "$name")
+
+  local run_dir
+  run_dir=$(active_run_dir "$exp_dir") || { echo "No runs for '${name}'."; exit 0; }
+
+  echo "Experiment: ${name}"
+  echo "Run:        $(basename "${run_dir}")"
+  echo "Room:       $(room_alias_for "$name")"
+  echo ""
+  (cd "${run_dir}" && docker compose ps)
+}
+
+# ── Dispatch ──────────────────────────────────────────────────────────────────
+
+command="${1:-}"
+shift || true
+
+case "$command" in
+  matrix)   cmd_matrix "$@" ;;
+  create)   cmd_create "$@" ;;
+  run)      cmd_run "$@" ;;
+  stop)     cmd_stop "$@" ;;
+  logs)     cmd_logs "$@" ;;
+  messages) cmd_messages "$@" ;;
+  watch)    cmd_watch "$@" ;;
+  list)     cmd_list ;;
+  status)   cmd_status "$@" ;;
+  help|--help|-h|"")  usage ;;
+  *)        die "Unknown command '${command}'. Run 'experiment help' for usage." ;;
+esac

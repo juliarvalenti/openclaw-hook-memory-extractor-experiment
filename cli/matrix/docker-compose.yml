@@ -1,0 +1,26 @@
+# Shared Matrix homeserver for all OpenClaw experiments.
+# Start once: experiment matrix start
+# All experiment runs connect to this via the openclaw-matrix network.
+
+services:
+  matrix:
+    image: matrixdotorg/synapse:latest
+    container_name: openclaw-matrix
+    volumes:
+      - ./data:/data
+    ports:
+      - "8008:8008"
+    networks:
+      - openclaw-matrix
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8008/health || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 24
+      start_period: 15s
+
+networks:
+  openclaw-matrix:
+    name: openclaw-matrix
+    driver: bridge
