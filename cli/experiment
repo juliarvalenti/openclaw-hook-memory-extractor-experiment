@@ -708,9 +708,9 @@ cmd_logs() {
     local agent_log_dir="${logs_dir}/${agent}"
     [[ -d "$agent_log_dir" ]] || die "No logs for agent '${agent}' in this run"
     if $follow; then
-      tail -f "${agent_log_dir}"/*.jsonl 2>/dev/null || echo "(no log files yet)"
+      tail -f "${agent_log_dir}"/* 2>/dev/null || echo "(no log files yet)"
     else
-      ls -lh "${agent_log_dir}"
+      cat "${agent_log_dir}"/* 2>/dev/null || echo "(no log files yet)"
     fi
   else
     if $follow; then
