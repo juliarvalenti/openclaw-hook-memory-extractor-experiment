@@ -1,15 +1,41 @@
 {
+  "models": {
+    "providers": {
+      "litellm": {
+        "baseUrl": "https://litellm.prod.outshift.ai",
+        "apiKey": "${ANTHROPIC_API_KEY}",
+        "api": "anthropic-messages",
+        "models": [
+          {
+            "id": "bedrock/global.anthropic.claude-haiku-4-5-20251001-v1:0",
+            "name": "Claude Haiku",
+            "input": ["text"],
+            "contextWindow": 200000,
+            "maxTokens": 8096
+          }
+        ]
+      }
+    }
+  },
   "agents": {
     "defaults": {
       "model": {
-        "primary": "anthropic/claude-haiku-4-5-20251001"
+        "primary": "litellm/bedrock/global.anthropic.claude-haiku-4-5-20251001-v1:0"
       }
     }
   },
   "gateway": {
     "port": 18789,
     "mode": "local",
-    "bind": "lan"
+    "bind": "lan",
+    "controlUi": {
+      "dangerouslyAllowHostHeaderOriginFallback": true
+    }
+  },
+  "hooks": {
+    "internal": {
+      "enabled": true
+    }
   },
   "plugins": {
     "entries": {

@@ -14,7 +14,10 @@
   "gateway": {
     "port": 18789,
     "mode": "local",
-    "bind": "lan"
+    "bind": "lan",
+    "controlUi": {
+      "dangerouslyAllowHostHeaderOriginFallback": true
+    }
   },
   "plugins": {
     "entries": {
