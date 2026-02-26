@@ -1,11 +1,12 @@
 /**
  * conversation-extractor/handler.js
  *
- * Reads the session JSONL after each agent response and emits a structured
- * conversation payload for ingestion into a memory/analytics service.
+ * Appends new completed turns to a .jsonl file on each agent:bootstrap or
+ * message:sent event. Tracks already-written turns by sessionId+index so the
+ * handler is idempotent regardless of which event fires first.
  *
- * Output: $OPENCLAW_EXTRACTOR_OUTPUT/conversation-extractor.log
- *         (falls back to ~/.openclaw/conversation-extractor.log)
+ * Output: $OPENCLAW_EXTRACTOR_OUTPUT/conversation-extractor.jsonl
+ *         (falls back to ~/.openclaw/conversation-extractor.jsonl)
  *
  * Hook events: agent:bootstrap, message:sent
  *
@@ -17,9 +18,8 @@ import fsPromises from "fs/promises";
 import path from "path";
 import os from "os";
 
-// Write to /logs if OPENCLAW_EXTRACTOR_OUTPUT is set (Docker mount), else ~/.openclaw
 const OUTPUT_DIR   = process.env.OPENCLAW_EXTRACTOR_OUTPUT ?? path.join(os.homedir(), ".openclaw");
-const LOG_FILE     = path.join(OUTPUT_DIR, "conversation-extractor.log");
+const LOG_FILE     = path.join(OUTPUT_DIR, "conversation-extractor.jsonl");
 
 const STATE_DIR    = path.join(os.homedir(), ".openclaw");
 const SESSIONS_DIR = path.join(STATE_DIR, "agents", "main", "sessions");
@@ -28,7 +28,8 @@ function resolveSessionFile(agentId, sessionId) {
   return path.join(STATE_DIR, "agents", agentId, "sessions", `${sessionId}.jsonl`);
 }
 
-/** On message:sent we don't get agentId/sessionId — find the newest session file. */
+/** Find the newest session file that contains at least one user-role message.
+ *  Skips Matrix context-only files (assistant-only). */
 async function findNewestSessionFile() {
   try {
     const files = (await fsPromises.readdir(SESSIONS_DIR)).filter(f => f.endsWith(".jsonl"));
@@ -37,7 +38,15 @@ async function findNewestSessionFile() {
       files.map(async f => ({ f, mtime: (await fsPromises.stat(path.join(SESSIONS_DIR, f))).mtimeMs }))
     );
     stats.sort((a, b) => b.mtime - a.mtime);
-    return path.join(SESSIONS_DIR, stats[0].f);
+    for (const { f } of stats) {
+      const filePath = path.join(SESSIONS_DIR, f);
+      const raw = await fsPromises.readFile(filePath, "utf-8").catch(() => "");
+      const hasUserMessage = raw.split("\n").some(line => {
+        try { return JSON.parse(line)?.message?.role === "user"; } catch { return false; }
+      });
+      if (hasUserMessage) return filePath;
+    }
+    return null;
   } catch {
     return null;
   }
@@ -144,7 +153,7 @@ function extractTurns(entries) {
     }
   }
 
-  if (current) turns.push(finalizeTurn(current));
+  // Only include finalized turns (current is still in-progress — skip it)
   return turns;
 }
 
@@ -169,43 +178,53 @@ function resolveSessionMeta(event, entries) {
   return { agentId, sessionId, sessionKey, channel: channelFromKey, cwd };
 }
 
-function buildPayload(sessionMeta, turns, entries) {
-  const totalCost = turns.reduce((sum, t) => sum + (t.usage?.cost?.total ?? 0), 0);
+function buildTurnPayload(sessionMeta, turn) {
   return {
-    schema: "openclaw-conversation-v1",
+    schema: "openclaw-turn-v1",
     extractedAt: new Date().toISOString(),
     session: sessionMeta,
-    stats: {
-      totalEntries: entries.length,
-      turns: turns.length,
-      toolCallCount: turns.reduce((n, t) => n + t.toolCalls.length, 0),
-      thinkingTurnCount: turns.filter((t) => t.thinking.length > 0).length,
-      totalCost,
-    },
-    turns: turns.map((t) => ({
-      index: t.index,
-      timestamp: t.timestamp,
-      model: t.model,
-      stopReason: t.stopReason,
-      usage: t.usage,
-      userMessage: t.userMessage,
-      thinking: t.thinking || null,
-      toolCalls: t.toolCalls.map((tc) => ({
+    turn: {
+      index: turn.index,
+      timestamp: turn.timestamp,
+      model: turn.model,
+      stopReason: turn.stopReason,
+      usage: turn.usage,
+      userMessage: turn.userMessage,
+      thinking: turn.thinking || null,
+      toolCalls: turn.toolCalls.map((tc) => ({
         id: tc.id,
         name: tc.name,
         input: tc.input,
         result: tc.result,
         isError: tc.isError,
       })),
-      response: t.response || null,
-    })),
+      response: turn.response || null,
+    },
   };
 }
 
-function appendLog(filePath, data) {
+function appendJsonlLine(filePath, data) {
   fs.mkdirSync(path.dirname(filePath), { recursive: true });
-  const sep = "\n" + "=".repeat(80) + "\n";
-  fs.appendFileSync(filePath, sep + JSON.stringify(data, null, 2) + "\n");
+  fs.appendFileSync(filePath, JSON.stringify(data) + "\n");
+}
+
+/** Read the highest turn index already written for a given sessionId. */
+function getLastWrittenTurnIndex(sessionId) {
+  try {
+    const lines = fs.readFileSync(LOG_FILE, "utf-8").trim().split("\n").filter(Boolean);
+    let max = -1;
+    for (const line of lines) {
+      try {
+        const obj = JSON.parse(line);
+        if (obj.schema === "openclaw-turn-v1" && obj.session?.sessionId === sessionId) {
+          if (obj.turn?.index > max) max = obj.turn.index;
+        }
+      } catch {}
+    }
+    return max;
+  } catch {
+    return -1;
+  }
 }
 
 export default async function HookHandler(event) {
@@ -214,26 +233,44 @@ export default async function HookHandler(event) {
   if (!isBootstrap && !isMessageSent) return;
 
   let sessionFile;
+  let sessionId = null;
 
   if (isBootstrap) {
-    const ctx       = event.context ?? {};
-    const agentId   = ctx.agentId  ?? "main";
-    const sessionId = ctx.sessionId ?? null;
-    if (!sessionId) return;
-    sessionFile = resolveSessionFile(agentId, sessionId);
+    const ctx = event.context ?? {};
+    const agentId   = ctx.agentId   ?? "main";
+    sessionId       = ctx.sessionId ?? null;
+    if (sessionId) {
+      sessionFile = resolveSessionFile(agentId, sessionId);
+    } else {
+      sessionFile = await findNewestSessionFile();
+    }
   } else {
-    // message:sent — no agentId/sessionId in context, find the newest session file
     sessionFile = await findNewestSessionFile();
-    if (!sessionFile) return;
   }
+
+  if (!sessionFile) return;
 
   const entries = await readSessionEntries(sessionFile);
   if (entries.length === 0) return;
 
+  // Resolve sessionId from file if not already known
+  if (!sessionId) {
+    const sessionEntry = entries.find(e => e.type === "session");
+    sessionId = sessionEntry?.id ?? path.basename(sessionFile, ".jsonl");
+  }
+
   const turns = extractTurns(entries);
   if (turns.length === 0) return;
 
-  const meta    = resolveSessionMeta(event, entries);
-  const payload = buildPayload(meta, turns, entries);
-  appendLog(LOG_FILE, payload);
+  const lastWritten = getLastWrittenTurnIndex(sessionId);
+  const newTurns = turns.filter(t => t.index > lastWritten);
+  if (newTurns.length === 0) return;
+
+  const meta = resolveSessionMeta(event, entries);
+  // Ensure sessionId is in meta for dedup to work on next call
+  meta.sessionId = meta.sessionId ?? sessionId;
+
+  for (const turn of newTurns) {
+    appendJsonlLine(LOG_FILE, buildTurnPayload(meta, turn));
+  }
 }

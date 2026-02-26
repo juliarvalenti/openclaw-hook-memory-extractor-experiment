@@ -35,6 +35,7 @@ export function makeAgentCommand(): Command {
 // Hooks installed via `openclaw hooks install` (when no workspace) or file copy (targeted workspace).
 const OPENCLAW_HOOKS: { name: string; files: string[] }[] = [
   { name: "ioc-inject",             files: ["HOOK.md", "package.json", "handler.js", "IOC_INSTRUCTIONS.md"] },
+  { name: "session-start",          files: ["HOOK.md", "package.json", "handler.js"] },
   { name: "conversation-extractor", files: ["HOOK.md", "package.json", "handler.js"] },
 ];
 

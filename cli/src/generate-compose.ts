@@ -15,6 +15,7 @@
 import * as fs from "fs";
 import * as path from "path";
 import * as yaml from "js-yaml";
+import { execSync } from "child_process";
 import type { ComposeFile, ComposeService } from "./types.js";
 
 const BASE_PORT = 18800;
@@ -141,12 +142,32 @@ function passwordVar(agentName: string): string {
   return `AGENT_${agentName.toUpperCase().replace(/-/g, "_")}_MATRIX_PASSWORD`;
 }
 
+// ── Port allocation ───────────────────────────────────────────────────────────
+// Find the next free port block by checking what's already bound on the host.
+// This prevents collisions when multiple experiments run simultaneously.
+
+function findNextAvailablePort(): number {
+  try {
+    const output = execSync('docker ps --format "{{.Ports}}"', { encoding: "utf8" });
+    let maxUsed = BASE_PORT - 1;
+    for (const match of output.matchAll(/:(\d+)->/g)) {
+      const port = parseInt(match[1], 10);
+      if (port >= BASE_PORT && port > maxUsed) maxUsed = port;
+    }
+    return maxUsed + 1;
+  } catch {
+    return BASE_PORT;
+  }
+}
+
+const startPort = findNextAvailablePort();
+
 // ── Build compose object ──────────────────────────────────────────────────────
 
 const agentServices: Record<string, ComposeService> = {};
 
 agentNames.forEach((name, i) => {
-  const port = BASE_PORT + i;
+  const port = startPort + i;
 
   agentServices[name] = {
     build: {

@@ -79,6 +79,24 @@ active_run_dir() {
   echo "${runs_dir}/${latest}"
 }
 
+DEFAULT_TIMEOUT="5m"
+DEFAULT_SERVER_PORT="8181"
+
+parse_duration() {
+  local raw="$1"
+  if [[ "$raw" =~ ^([0-9]+)(s|m|h)$ ]]; then
+    local val="${BASH_REMATCH[1]}"
+    local unit="${BASH_REMATCH[2]}"
+    case "$unit" in
+      s) echo "$val" ;;
+      m) echo $((val * 60)) ;;
+      h) echo $((val * 3600)) ;;
+    esac
+  else
+    die "Invalid duration '${raw}'. Use format: 30s, 5m, 1h"
+  fi
+}
+
 # room_alias_for <experiment-slug>  →  #trip-planner-s1-20260223T185939Z:local
 room_alias_for() {
   echo "#${1}:local"
@@ -181,11 +199,13 @@ post_seed_message() {
   echo "==> Posting seed message to ${room_alias}..."
 
   local txn_id="exp-seed-$(date +%s)"
+  local body_json
+  body_json=$(node -e "process.stdout.write(JSON.stringify({msgtype:'m.text',body:process.argv[1]}))" "$seed")
   curl -sf \
     -X PUT "${homeserver}/_matrix/client/r0/rooms/${room_id}/send/m.room.message/${txn_id}" \
     -H "Authorization: Bearer ${token}" \
     -H "Content-Type: application/json" \
-    -d "{\"msgtype\":\"m.text\",\"body\":\"${seed}\"}" > /dev/null
+    -d "$body_json" > /dev/null
 
   echo "    Seed posted."
 }
@@ -428,6 +448,15 @@ cmd_create() {
 
 cmd_run() {
   local name="${1:-}"
+  local timeout_arg="${DEFAULT_TIMEOUT}"
+  shift || true
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --timeout|-t) timeout_arg="${2:-}"; shift 2 ;;
+      *) shift ;;
+    esac
+  done
+
   local exp_dir
   exp_dir=$(require_experiment "$name")
 
@@ -591,7 +620,7 @@ cmd_run() {
         -H "Authorization: Bearer ${obs_token}" \
         -H "Content-Type: application/json" \
         -d "{
-          \"room_alias_name\": \"${name}\",
+          \"room_alias_name\": \"${name}-${timestamp}\",
           \"name\": \"${room_name}\",
           \"preset\": \"public_chat\",
           \"visibility\": \"public\"
@@ -675,6 +704,26 @@ cmd_run() {
   echo ""
   echo "    Stop:"
   echo "      experiment stop ${name}"
+  echo ""
+  echo "    Watch:"
+  echo "      http://localhost:${DEFAULT_SERVER_PORT}/experiments/${name}/watch  (SSE)"
+  echo "      experiment watch ${name}  (terminal)"
+  echo ""
+  echo "    Matrix room: ${room_alias}"
+
+  # ── Auto-timeout ──────────────────────────────────────────────────────────
+  local timeout_secs
+  timeout_secs=$(parse_duration "$timeout_arg")
+  local deadline=$(( $(date +%s) + timeout_secs ))
+  echo "$deadline" > "${run_dir}/timeout.deadline"
+  (
+    sleep "$timeout_secs"
+    echo "==> Timeout reached (${timeout_arg}). Stopping experiment '${name}'..."
+    "${BASH_SOURCE[0]}" stop "$name"
+  ) &
+  echo $! > "${run_dir}/timeout.pid"
+  echo ""
+  echo "    Auto-stop in ${timeout_arg} (override with --timeout <duration>, e.g. --timeout 10m)"
 }
 
 cmd_stop() {
@@ -686,6 +735,15 @@ cmd_stop() {
   run_dir=$(active_run_dir "$exp_dir") || die "No runs found for '${name}'"
 
   echo "==> Stopping run: $(basename "${run_dir}")"
+
+  local pid_file="${run_dir}/timeout.pid"
+  if [[ -f "$pid_file" ]]; then
+    local timer_pid
+    timer_pid=$(cat "$pid_file")
+    kill "$timer_pid" 2>/dev/null && echo "==> Cancelled timeout timer (pid ${timer_pid})"
+    rm -f "$pid_file"
+  fi
+
   (cd "${run_dir}" && docker compose down)
   echo "==> Stopped."
 }
@@ -825,8 +883,38 @@ cmd_status() {
   echo "Experiment: ${name}"
   echo "Run:        $(basename "${run_dir}")"
   echo "Room:       $(room_alias_for "${name}-$(basename "$run_dir")")"
+
+  local deadline_file="${run_dir}/timeout.deadline"
+  if [[ -f "$deadline_file" ]]; then
+    local deadline now remaining
+    deadline=$(cat "$deadline_file")
+    now=$(date +%s)
+    remaining=$(( deadline - now ))
+    if [[ $remaining -gt 0 ]]; then
+      printf "Timeout:    %dm %ds remaining\n" $((remaining / 60)) $((remaining % 60))
+    else
+      echo "Timeout:    expired"
+    fi
+  fi
+
   echo ""
   (cd "${run_dir}" && docker compose ps)
+}
+
+cmd_server() {
+  local port="${DEFAULT_SERVER_PORT}"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --port|-p) port="${2:-}"; shift 2 ;;
+      *) shift ;;
+    esac
+  done
+  echo "==> Experiment API on http://0.0.0.0:${port}"
+  (
+    export EXPERIMENT_SCRIPT="${BASH_SOURCE[0]}"
+    export EXPERIMENTS_DIR="${EXPERIMENTS_DIR}"
+    cd "${SCRIPT_DIR}" && npx tsx src/server.ts "${port}"
+  )
 }
 
 # ── Dispatch ──────────────────────────────────────────────────────────────────
@@ -844,6 +932,7 @@ case "$command" in
   watch)    cmd_watch "$@" ;;
   list)     cmd_list ;;
   status)   cmd_status "$@" ;;
+  server)   cmd_server "$@" ;;
   help|--help|-h|"")  usage ;;
   *)        die "Unknown command '${command}'. Run 'experiment help' for usage." ;;
 esac

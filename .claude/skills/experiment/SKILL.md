@@ -32,7 +32,8 @@ Parse their intent and run the right command. Be direct — don't ask for confir
 
 # Experiments
 ./cli/experiment create <name> [agent1] [agent2] ...
-./cli/experiment run    <name>
+./cli/experiment run    <name>                  # default timeout: 5m
+./cli/experiment run    <name> --timeout 10m    # custom timeout (5m/30m/1h/etc)
 ./cli/experiment stop   <name>
 ./cli/experiment list
 ./cli/experiment status <name>
@@ -42,9 +43,31 @@ Parse their intent and run the right command. Be direct — don't ask for confir
 ./cli/experiment logs   <name> <agent> --follow # live tail for one agent
 ./cli/experiment messages <name> [limit]        # snapshot recent room messages
 ./cli/experiment watch  <name>                  # live tail Matrix room
+./cli/experiment server                         # start REST API on port 7777
+./cli/experiment server --port 8080             # custom port
 ```
 
-Each experiment gets its own Matrix room: `#<experiment-slug>:local`
+### REST API
+
+Start with `./cli/experiment server`. Mirrors all CLI commands over HTTP. No auth required (VPN-gated).
+
+```
+GET  /health
+POST /matrix/start|stop          GET /matrix/status
+GET  /experiments                POST /experiments  { name, agents?: [] }
+GET  /experiments/:name/status
+POST /experiments/:name/run      body: { timeout?: "5m" }
+POST /experiments/:name/stop
+GET  /experiments/:name/logs     ?agent=<name>  &follow=true → SSE
+GET  /experiments/:name/messages ?limit=20
+GET  /experiments/:name/watch    → SSE stream of room messages
+```
+
+SSE events from `/watch`: `data: {"sender":"@agent:local","body":"...","timestamp":1234567890}`
+
+Each run gets its own Matrix room: `#<experiment-slug>-<timestamp>:local`
+
+Experiments auto-stop after 5 minutes by default. Pass `--timeout` to override (e.g. `--timeout 10m`, `--timeout 1h`). `experiment status` shows remaining time.
 
 ### Experiment structure
 
