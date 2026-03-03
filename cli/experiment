@@ -228,6 +228,13 @@ scaffold_agent() {
     cp -r "${base_skills_dir}/." "${agent_dir}/workspace/skills/"
   fi
 
+  # Base hooks — auto-install into every agent (at ~/.openclaw/hooks/, not workspace/)
+  local base_hooks_dir="${EXPERIMENTS_DIR}/_base-hooks"
+  if [[ -d "${base_hooks_dir}" ]]; then
+    mkdir -p "${agent_dir}/hooks"
+    cp -r "${base_hooks_dir}/." "${agent_dir}/hooks/"
+  fi
+
   # IDENTITY.md — pre-fill with agent name
   cat > "${agent_dir}/workspace/IDENTITY.md" << EOF
 # Identity
@@ -630,19 +637,6 @@ cmd_run() {
       echo "    Room exists: ${room_alias}"
     fi
   fi
-
-  # ── Install OpenHive hooks into each agent workspace ─────────────────────
-  echo "==> Configuring agents (openhive)..."
-  local openhive_tsx="${SCRIPT_DIR}/openhive/node_modules/.bin/tsx"
-  local openhive_src="${SCRIPT_DIR}/openhive/src/index.ts"
-  for agent in "${agent_names[@]}"; do
-    local workspace="${agents_dir}/${agent}/workspace"
-    if "${openhive_tsx}" "${openhive_src}" agent configure openclaw --workspace "${workspace}" 2>/dev/null; then
-      echo "    ${agent}: IOC hook installed"
-    else
-      echo "    ${agent}: openhive not available, skipping"
-    fi
-  done
 
   # ── Start agents ──────────────────────────────────────────────────────────
   echo "==> Starting agents..."

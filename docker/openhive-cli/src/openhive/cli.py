@@ -1,0 +1,86 @@
+"""
+OpenHive CLI — IoC/CFN coordination layer.
+"""
+
+import typer
+
+from openhive import __version__
+from openhive.commands import (
+    adapter,
+    announce,
+    checkin,
+    config,
+    daemon,
+    docs,
+    install,
+    instance,
+    message,
+    onboard,
+    room,
+    send,
+)
+
+app = typer.Typer(
+    name="openhive",
+    help="OpenHive CLI — IoC/CFN coordination layer",
+    add_completion=True,
+    no_args_is_help=True,
+    pretty_exceptions_show_locals=False,
+    rich_markup_mode=None,
+)
+
+
+def version_callback(value: bool) -> None:
+    if value:
+        typer.echo(f"OpenHive CLI version {__version__}")
+        raise typer.Exit()
+
+
+@app.callback()
+def main(
+    ctx: typer.Context,
+    version: bool | None = typer.Option(  # noqa: ARG001
+        None,
+        "--version",
+        "-V",
+        callback=version_callback,
+        is_eager=True,
+        help="Print version information",
+    ),
+    verbose: bool = typer.Option(False, "--verbose", "-v", help="Enable verbose/debug output"),
+    quiet: bool = typer.Option(False, "--quiet", "-q", help="Suppress non-essential output"),
+    json_output: bool = typer.Option(False, "--json", help="Output in JSON format"),
+) -> None:
+    """OpenHive CLI — IoC/CFN coordination layer."""
+    ctx.ensure_object(dict)
+    ctx.obj["verbose"] = verbose
+    ctx.obj["quiet"] = quiet
+    ctx.obj["json"] = json_output
+
+
+# Top-level instance commands
+app.command(name="init")(instance.init)
+app.command(name="install")(install.install)
+app.command(name="up")(instance.start)
+app.command(name="down")(instance.stop)
+app.command(name="status")(instance.status)
+app.command(name="logs")(instance.logs)
+
+# Top-level coordination commands
+app.command(name="onboard")(onboard.onboard)
+app.command(name="checkin")(checkin.checkin)
+app.command(name="send")(send.send)
+app.command(name="announce")(announce.announce)
+app.command(name="watch")(room.watch)
+
+# Command groups
+app.add_typer(room.app, name="room")
+app.add_typer(message.app, name="message")
+app.add_typer(config.app, name="config")
+app.add_typer(daemon.app, name="daemon")
+app.add_typer(adapter.app, name="adapter")
+app.add_typer(docs.app, name="docs")
+
+
+if __name__ == "__main__":
+    app()

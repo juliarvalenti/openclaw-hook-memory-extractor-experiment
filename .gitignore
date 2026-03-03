@@ -34,3 +34,11 @@ experiments/*/runs/
 experiments/*
 !experiments/_template
 !experiments/_base-skills
+!experiments/_base-hooks
+
+# Python build artifacts
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.venv/

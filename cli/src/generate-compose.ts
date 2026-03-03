@@ -194,7 +194,11 @@ agentNames.forEach((name, i) => {
       MATRIX_USER_ID: userId(name),
       MATRIX_PASSWORD: `\${${passwordVar(name)}:?${passwordVar(name)} is required}`,
       OPENCLAW_EXTRACTOR_OUTPUT: "/logs",
+      // OpenHive coordination back channel
+      OPENHIVE_API_URL: "${OPENHIVE_API_URL:-}",
+      OPENHIVE_CHANNEL_ID: experimentName,
     },
+    extra_hosts: ["host.docker.internal:host-gateway"],
     volumes: [
       `${experimentDir}/agents/${name}:/home/node/.openclaw`,
       `${runDir}/logs/${name}:/logs`,
