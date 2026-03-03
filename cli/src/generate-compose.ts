@@ -164,6 +164,8 @@ const startPort = findNextAvailablePort();
 
 // ── Build compose object ──────────────────────────────────────────────────────
 
+const experimentName = path.basename(experimentDir);
+
 const agentServices: Record<string, ComposeService> = {};
 
 agentNames.forEach((name, i) => {
@@ -221,7 +223,6 @@ const compose: ComposeFile = {
 
 // ── Emit ──────────────────────────────────────────────────────────────────────
 
-const experimentName = path.basename(experimentDir);
 const runName = path.basename(runDir);
 
 const header = [
