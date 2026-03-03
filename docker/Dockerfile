@@ -9,5 +9,6 @@ WORKDIR /app
 ENV CI=true
 RUN pnpm install --frozen-lockfile
 
+USER root
 COPY docker/openhive-cli /tmp/openhive-cli
 RUN pip install --no-cache-dir /tmp/openhive-cli
