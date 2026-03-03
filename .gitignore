@@ -35,6 +35,7 @@ experiments/*
 !experiments/_template
 !experiments/_base-skills
 !experiments/_base-hooks
+!experiments/_base-extensions
 
 # Python build artifacts
 __pycache__/

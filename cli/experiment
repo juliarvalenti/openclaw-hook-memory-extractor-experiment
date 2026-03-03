@@ -235,6 +235,13 @@ scaffold_agent() {
     cp -r "${base_hooks_dir}/." "${agent_dir}/hooks/"
   fi
 
+  # Base extensions (plugins) — auto-install into ~/.openclaw/extensions/ (auto-discovered by OpenClaw)
+  local base_extensions_dir="${EXPERIMENTS_DIR}/_base-extensions"
+  if [[ -d "${base_extensions_dir}" ]]; then
+    mkdir -p "${agent_dir}/extensions"
+    cp -r "${base_extensions_dir}/." "${agent_dir}/extensions/"
+  fi
+
   # IDENTITY.md — pre-fill with agent name
   cat > "${agent_dir}/workspace/IDENTITY.md" << EOF
 # Identity
