@@ -69,5 +69,5 @@ openhive announce --room <room-name> --status "done: <brief summary>"
 ## Notes
 
 - Never specify a room name in `room join` or `message query` — it's auto-resolved.
-- The room name is `oh-{channelId}` where `channelId` is your Matrix/Slack channel.
+- The room name matches the channel/experiment ID directly — no prefix added.
 - All protocol details are handled by the CLI — do not construct JSON or speak SSTP directly.

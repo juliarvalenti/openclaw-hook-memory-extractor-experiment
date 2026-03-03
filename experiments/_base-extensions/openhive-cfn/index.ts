@@ -39,7 +39,7 @@ function resolveHandle(): string {
 }
 
 function roomName(): string | null {
-  return CHANNEL_ID ? `oh-${CHANNEL_ID}` : null;
+  return CHANNEL_ID || null;
 }
 
 async function apiPost(
