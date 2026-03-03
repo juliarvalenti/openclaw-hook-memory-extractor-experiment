@@ -23,10 +23,14 @@ const CHANNEL_ID = process.env.OPENHIVE_CHANNEL_ID ?? "";
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 /**
- * Derive a stable handle from the Matrix user ID.
- * "@city-selector-abc123:local" → "city-selector-abc123"
+ * Derive a stable handle for this agent.
+ * Prefers OPENHIVE_AGENT_HANDLE (set explicitly by generate-compose.ts),
+ * falls back to stripping MATRIX_USER_ID ("@name-runid:local" → "name-runid").
  */
 function resolveHandle(): string {
+  if (process.env.OPENHIVE_AGENT_HANDLE) {
+    return process.env.OPENHIVE_AGENT_HANDLE;
+  }
   const matrixId = process.env.MATRIX_USER_ID ?? "";
   if (matrixId.startsWith("@")) {
     return matrixId.slice(1).split(":")[0];

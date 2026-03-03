@@ -199,6 +199,7 @@ agentNames.forEach((name, i) => {
       // OpenHive coordination back channel
       OPENHIVE_API_URL: "${OPENHIVE_API_URL:-}",
       OPENHIVE_CHANNEL_ID: experimentName,
+      OPENHIVE_AGENT_HANDLE: name,
     },
     extra_hosts: ["host.docker.internal:host-gateway"],
     volumes: [
