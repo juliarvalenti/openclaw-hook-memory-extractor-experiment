@@ -1,0 +1,11 @@
+{
+  "id": "openhive-cfn",
+  "name": "OpenHive CFN Adapter",
+  "description": "Bridges OpenClaw agents to the OpenHive coordination backend. Covers session lifecycle, pre-turn context injection, and output forwarding.",
+  "version": "0.1.0",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {}
+  }
+}

@@ -1,8 +1,8 @@
 """
-Adapter commands — connect agent frameworks to IoC/CFN.
+Adapter commands — connect agent frameworks to OpenHive.
 
 Supported adapters:
-  openclaw    — hook-based (installs JS hook + openhive skill into OpenClaw)
+  openclaw    — runs `openclaw plugins install` with the bundled openhive-cfn plugin
 
 Planned:
   cursor      — SDK harness (next sprint)
@@ -12,6 +12,8 @@ Planned:
 import importlib.resources
 import json as json_module
 import shutil
+import subprocess
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -24,21 +26,12 @@ from openhive.error_handler import print_error
 app = typer.Typer(help="Manage agent framework adapters")
 
 ADAPTER_TYPES = {
-    "openclaw": "hook-based — installs JS hook + OpenHive skill into OpenClaw",
+    "openclaw": "plugin-based — installs openhive-cfn via `openclaw plugins install`",
     "cursor": "sdk-based — generates CFN harness for Cursor agents (planned)",
     "claude-code": "sdk-based — generates CFN harness for Claude Code (planned)",
 }
 
-ADAPTER_DEFAULTS: dict[str, dict] = {
-    "openclaw": {
-        "hooks_dir": "~/.openclaw/hooks",
-        "skills_dir": "~/.openclaw/skills",
-    },
-}
-
-# Names of the installed hook/skill directories
-_OPENCLAW_HOOK_NAME = "openhive-inject"
-_OPENCLAW_SKILL_NAME = "openhive"
+_OPENCLAW_PLUGIN_NAME = "openhive-cfn"
 
 
 @app.callback()
@@ -50,8 +43,6 @@ def adapter_main(ctx: typer.Context) -> None:
 def add(
     ctx: typer.Context,
     adapter_type: str = typer.Argument(..., help="Adapter type: openclaw, cursor, claude-code"),
-    hooks_dir: Optional[str] = typer.Option(None, "--hooks-dir", help="Override default hooks directory"),
-    skills_dir: Optional[str] = typer.Option(None, "--skills-dir", help="Override default skills directory"),
     dry_run: bool = typer.Option(False, "--dry-run", help="Show what would be installed without doing it"),
 ) -> None:
     """
@@ -59,7 +50,6 @@ def add(
 
     Examples:
         openhive adapter add openclaw
-        openhive adapter add openclaw --hooks-dir ~/.openclaw/hooks
     """
     try:
         verbose = ctx.obj.get("verbose", False) if ctx.obj else False
@@ -79,29 +69,16 @@ def add(
             )
             raise typer.Exit(0)
 
-        defaults = ADAPTER_DEFAULTS.get(adapter_type, {})
-        resolved_hooks_dir = (
-            Path(hooks_dir or defaults["hooks_dir"]).expanduser()
-            if (hooks_dir or defaults.get("hooks_dir"))
-            else None
-        )
-        resolved_skills_dir = (
-            Path(skills_dir or defaults["skills_dir"]).expanduser()
-            if (skills_dir or defaults.get("skills_dir"))
-            else None
-        )
-
         if dry_run:
+            plugin_src = _resolve_plugin_src()
             typer.secho(f"[dry-run] Would install adapter: {adapter_type}", fg=typer.colors.CYAN)
-            if resolved_hooks_dir:
-                typer.echo(f"  hook:       {resolved_hooks_dir / _OPENCLAW_HOOK_NAME}/")
-            if resolved_skills_dir:
-                typer.echo(f"  skill:      {resolved_skills_dir / _OPENCLAW_SKILL_NAME}/")
-            typer.echo(f"  cfn_url:    {config.server.cfn_url}")
+            typer.echo(f"  plugin src: {plugin_src}/")
+            typer.echo(f"  command:    openclaw plugins install {plugin_src}")
+            typer.echo(f"  api_url:    {config.server.api_url}")
             return
 
         if adapter_type == "openclaw":
-            _install_openclaw(resolved_hooks_dir, resolved_skills_dir, verbose=verbose)
+            _install_openclaw(verbose=verbose)
         else:
             typer.secho(f"Adapter '{adapter_type}' is planned but not yet implemented.", fg=typer.colors.YELLOW)
             raise typer.Exit(1)
@@ -109,12 +86,8 @@ def add(
         adapter_record: dict = {
             "type": adapter_type,
             "installed_at": datetime.now(timezone.utc).isoformat(),
-            "cfn_url": config.server.cfn_url,
+            "api_url": config.server.api_url,
         }
-        if resolved_hooks_dir:
-            adapter_record["hooks_dir"] = str(resolved_hooks_dir)
-        if resolved_skills_dir:
-            adapter_record["skills_dir"] = str(resolved_skills_dir)
 
         config.adapters[adapter_type] = adapter_record
         config.save()
@@ -123,11 +96,10 @@ def add(
             typer.echo(json_module.dumps(adapter_record, indent=2))
         else:
             typer.secho(f"Adapter '{adapter_type}' installed.", fg=typer.colors.GREEN)
-            if resolved_hooks_dir:
-                typer.echo(f"  hook:   {resolved_hooks_dir / _OPENCLAW_HOOK_NAME}/")
-            if resolved_skills_dir:
-                typer.echo(f"  skill:  {resolved_skills_dir / _OPENCLAW_SKILL_NAME}/")
-            typer.echo(f"  cfn:    {config.server.cfn_url}")
+            typer.echo(f"  plugin:   {_OPENCLAW_PLUGIN_NAME}")
+            typer.echo(f"  api_url:  {config.server.api_url}")
+            typer.echo("")
+            typer.echo("  Set OPENHIVE_API_URL and OPENHIVE_CHANNEL_ID in your agent environment.")
 
     except typer.Exit:
         raise
@@ -248,63 +220,63 @@ def status(
 
 # ── Adapter-specific install / uninstall ──────────────────────────────────────
 
-def _openclaw_data_dir() -> Path:
-    """Return the path to the bundled openclaw adapter package data."""
+def _resolve_plugin_src() -> Path:
+    """
+    Return a real filesystem path to the bundled openhive-cfn plugin directory.
+
+    importlib.resources may return a path inside a zip for non-editable installs,
+    so we extract to a temp dir in that case. The caller is responsible for
+    cleanup if a temp dir was created (check path.parts for tmp).
+    """
     pkg = importlib.resources.files("openhive.adapters.openclaw")
-    # importlib.resources returns a Traversable; resolve to a real Path
-    return Path(str(pkg))
+    src = Path(str(pkg)) / "extensions" / _OPENCLAW_PLUGIN_NAME
+
+    if src.exists():
+        return src
+
+    # Non-editable install: extract from the package zip to a temp dir
+    tmp = Path(tempfile.mkdtemp(prefix="openhive-plugin-"))
+    dst = tmp / _OPENCLAW_PLUGIN_NAME
+    dst.mkdir()
+    for entry in (pkg / "extensions" / _OPENCLAW_PLUGIN_NAME).iterdir():
+        (dst / entry.name).write_bytes(entry.read_bytes())
+    return dst
 
 
-def _install_openclaw(
-    hooks_dir: Optional[Path],
-    skills_dir: Optional[Path],
-    verbose: bool = False,
-) -> None:
+def _install_openclaw(verbose: bool = False) -> None:
     """
-    Copy the bundled openhive-inject hook directory and openhive skill directory
-    into the target OpenClaw installation.
+    Install the bundled openhive-cfn plugin via `openclaw plugins install <path>`.
 
-    Hook:  openhive-inject/ (handler.js ES module, fires on agent:bootstrap,
-           injects OPENHIVE_INSTRUCTIONS.md into every agent turn)
-
-    Skill: openhive/ (SKILL.md — CLI command reference; agents never see SSTP)
+    Covers the full CFN adapter lifecycle:
+      gateway_start, gateway_stop, session_start, session_end,
+      before_agent_start, message_sent
     """
-    data_dir = _openclaw_data_dir()
+    plugin_src = _resolve_plugin_src()
+    cmd = ["openclaw", "plugins", "install", str(plugin_src)]
+    if verbose:
+        typer.echo(f"  running: {' '.join(cmd)}")
 
-    if hooks_dir:
-        hooks_dir.mkdir(parents=True, exist_ok=True)
-        src_hook = data_dir / "hooks" / _OPENCLAW_HOOK_NAME
-        dst_hook = hooks_dir / _OPENCLAW_HOOK_NAME
-        if dst_hook.exists():
-            shutil.rmtree(dst_hook)
-        shutil.copytree(src_hook, dst_hook)
-        if verbose:
-            typer.echo(f"  wrote hook: {dst_hook}/")
-
-    if skills_dir:
-        skills_dir.mkdir(parents=True, exist_ok=True)
-        src_skill = data_dir / "skills" / _OPENCLAW_SKILL_NAME
-        dst_skill = skills_dir / _OPENCLAW_SKILL_NAME
-        if dst_skill.exists():
-            shutil.rmtree(dst_skill)
-        shutil.copytree(src_skill, dst_skill)
-        if verbose:
-            typer.echo(f"  wrote skill: {dst_skill}/")
+    result = subprocess.run(cmd, text=True, capture_output=not verbose)
+    if result.returncode != 0:
+        stderr = result.stderr.strip() if result.stderr else ""
+        raise RuntimeError(
+            f"`openclaw plugins install` failed (exit {result.returncode})"
+            + (f": {stderr}" if stderr else "")
+        )
 
 
 def _uninstall_openclaw(adapter_record: dict) -> None:
-    """Remove OpenHive hook and skill directories from an OpenClaw installation."""
-    hooks_dir = adapter_record.get("hooks_dir")
-    if hooks_dir:
-        p = Path(hooks_dir) / _OPENCLAW_HOOK_NAME
-        if p.exists():
-            shutil.rmtree(p)
-
-    skills_dir = adapter_record.get("skills_dir")
-    if skills_dir:
-        p = Path(skills_dir) / _OPENCLAW_SKILL_NAME
-        if p.exists():
-            shutil.rmtree(p)
+    """Uninstall the openhive-cfn plugin via `openclaw plugins uninstall`."""
+    result = subprocess.run(
+        ["openclaw", "plugins", "uninstall", _OPENCLAW_PLUGIN_NAME],
+        text=True, capture_output=True,
+    )
+    # Non-zero exit is acceptable if the plugin was already removed manually
+    if result.returncode != 0 and "not found" not in (result.stderr or "").lower():
+        typer.secho(
+            f"  warning: openclaw plugins uninstall exited {result.returncode}",
+            fg=typer.colors.YELLOW,
+        )
 
 
 def _check_adapter_status(name: str, info: dict) -> dict:
@@ -313,25 +285,17 @@ def _check_adapter_status(name: str, info: dict) -> dict:
     ok = True
 
     if name == "openclaw":
-        hooks_dir = info.get("hooks_dir")
-        if hooks_dir:
-            hook = Path(hooks_dir) / _OPENCLAW_HOOK_NAME / "handler.js"
-            if hook.exists():
-                details.append(f"hook installed: {hook.parent}/")
-            else:
-                details.append(f"hook missing: {hook.parent}/")
-                ok = False
+        result = subprocess.run(
+            ["openclaw", "plugins", "info", _OPENCLAW_PLUGIN_NAME],
+            text=True, capture_output=True,
+        )
+        if result.returncode == 0:
+            details.append(f"plugin installed: {_OPENCLAW_PLUGIN_NAME}")
+        else:
+            details.append(f"plugin not found: {_OPENCLAW_PLUGIN_NAME} (run: openhive adapter add openclaw)")
+            ok = False
 
-        skills_dir = info.get("skills_dir")
-        if skills_dir:
-            skill = Path(skills_dir) / _OPENCLAW_SKILL_NAME / "SKILL.md"
-            if skill.exists():
-                details.append(f"skill installed: {skill.parent}/")
-            else:
-                details.append(f"skill missing: {skill.parent}/")
-                ok = False
-
-    cfn_url = info.get("cfn_url", "")
-    details.append(f"cfn_url: {cfn_url}")
+    api_url = info.get("api_url", "")
+    details.append(f"api_url: {api_url}")
 
     return {"ok": ok, "details": details}

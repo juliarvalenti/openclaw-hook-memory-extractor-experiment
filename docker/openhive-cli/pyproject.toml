@@ -58,8 +58,7 @@ where = ["src"]
 openhive = [
     "py.typed",
     "docs/**/*.md",
-    "adapters/openclaw/hooks/openhive-inject/*",
-    "adapters/openclaw/skills/openhive/*",
+    "adapters/openclaw/extensions/openhive-cfn/*",
     "docker/*",
 ]
 
