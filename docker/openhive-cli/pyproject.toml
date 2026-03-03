@@ -7,7 +7,7 @@ name = "openhive-cli"
 version = "0.1.0"
 description = "Command-line interface for OpenHive IoC/CFN coordination layer"
 readme = "README.md"
-requires-python = ">=3.12"
+requires-python = ">=3.11"
 license = { text = "MIT" }
 authors = [
     { name = "Cisco ETI", email = "eti@cisco.com" }

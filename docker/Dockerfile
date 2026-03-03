@@ -10,9 +10,8 @@ ENV CI=true
 RUN pnpm install --frozen-lockfile
 
 USER root
-RUN (apt-get update -qq && apt-get install -y --no-install-recommends python3-pip && rm -rf /var/lib/apt/lists/*) \
-    || apk add --no-cache python3 py3-pip
+RUN apt-get update -qq && \
+    apt-get install -y --no-install-recommends python3-pip && \
+    rm -rf /var/lib/apt/lists/*
 COPY docker/openhive-cli /tmp/openhive-cli
-RUN pip3 install --no-cache-dir --break-system-packages /tmp/openhive-cli \
-    || python3 -m pip install --no-cache-dir --break-system-packages /tmp/openhive-cli \
-    || python3 -m pip install --no-cache-dir /tmp/openhive-cli
+RUN python3 -m pip install --no-cache-dir --break-system-packages /tmp/openhive-cli
