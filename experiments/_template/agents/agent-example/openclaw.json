@@ -49,7 +49,7 @@
       "groupPolicy": "open",
       "groups": {
         "#agents:local": {
-          "requireMention": false
+          "requireMention": true
         }
       }
     }

@@ -128,6 +128,22 @@ for (const name of agentNames) {
   delete groups[oldKey];
   groups[roomAlias] = settings;
 
+  // Inject mentionPatterns so bot-to-bot @mentions are recognised
+  const msgConfig = config as Record<string, unknown>;
+  if (!msgConfig.messages) {
+    msgConfig.messages = { groupChat: { mentionPatterns: [`@${name}`] } };
+  } else {
+    const messages = msgConfig.messages as Record<string, unknown>;
+    if (!messages.groupChat) {
+      messages.groupChat = { mentionPatterns: [`@${name}`] };
+    } else {
+      const groupChat = messages.groupChat as Record<string, unknown>;
+      if (!groupChat.mentionPatterns) {
+        groupChat.mentionPatterns = [`@${name}`];
+      }
+    }
+  }
+
   fs.writeFileSync(configPath, JSON.stringify(config, null, 2) + "\n");
 }
 
