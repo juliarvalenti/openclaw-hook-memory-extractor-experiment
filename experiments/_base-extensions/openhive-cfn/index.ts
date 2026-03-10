@@ -8,17 +8,70 @@
  *   gateway_stop       — graceful shutdown log
  *   session_start      — register agent in coordination room (Begin Session)
  *   session_end        — announce agent departure (End Session)
- *   before_agent_start — inject latest coordination tick/consensus as prependContext
+ *   before_agent_start — inject coordination instructions + latest tick/consensus as prependContext
  *   message_sent       — forward agent output to coordination room
  *
  * Environment variables (injected by generate-compose.ts):
  *   OPENHIVE_API_URL     — OpenHive backend base URL, e.g. http://host.docker.internal:8000
- *   OPENHIVE_CHANNEL_ID  — Experiment/channel ID; coordination room = oh-{channelId}
+ *   OPENHIVE_CHANNEL_ID  — Experiment/channel ID (used as-is as the room name)
  *   MATRIX_USER_ID       — Agent Matrix ID, e.g. @city-selector-abc123:local; used as handle
  */
 
+// ── Coordination instructions injected into every agent turn ─────────────────
+
+const OPENHIVE_INSTRUCTIONS = `\
+# OpenHive Multi-Agent Coordination
+
+You are operating in a shared coordination session with other AI agents managed by OpenHive.
+Use the \`openhive\` CLI to participate. Do not attempt to speak SSTP JSON directly.
+
+The coordination room is automatically resolved from your environment — you do not specify a room name.
+
+## Triggering coordination
+
+When a user appends \`/openhive\` to their message, or when you are assigned to a
+multi-agent coordination task, start the coordination flow:
+
+## Step 1 — Join the coordination backchannel
+
+\`\`\`
+openhive room join -m "<your requirements or perspective>"
+\`\`\`
+
+This command **blocks** (~30s) while other agents join and post their requirements.
+When the first tick fires, it prints a clarification question from CognitiveEngine and returns.
+
+## Step 2 — Respond to coordination questions
+
+Read the printed question, then respond:
+
+\`\`\`
+openhive message query "<your response to the coordination question>"
+\`\`\`
+
+This command **blocks** until all agents respond and CognitiveEngine processes them.
+It then prints the next question or your final assignment.
+
+## Step 3 — Repeat until consensus
+
+Repeat step 2 until you receive a \`[consensus]\` message — your specific assignment
+will be printed. Then proceed with your assignment independently.
+
+## Room discipline
+
+- Speak only when you have something new to contribute.
+- Do not echo, acknowledge, or confirm receipt of messages.
+- If another agent has already answered adequately, stay silent.
+- Default to silence.
+`;
+
+// ─────────────────────────────────────────────────────────────────────────────
+
 const API_URL = (process.env.OPENHIVE_API_URL ?? "").replace(/\/$/, "");
 const CHANNEL_ID = process.env.OPENHIVE_CHANNEL_ID ?? "";
+const WORKSPACE_ID = process.env.OPENHIVE_WORKSPACE_ID ?? "";
+const MAS_ID = process.env.OPENHIVE_MAS_ID ?? "";
+const AGENT_ID = process.env.OPENHIVE_AGENT_ID ?? "";
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -159,58 +212,61 @@ export default function register(api: {
   });
 
   // ── before_agent_start ─────────────────────────────────────────────────────
-  // Fetch the latest coordination event from OpenHive and inject it as
-  // prependContext — covers "Input Pre Processing" and "Output Gen Pre" from
-  // the CFN adapter spec. The agent sees its assignment before every turn.
+  // Always inject coordination instructions. If a room is active, also fetch
+  // the latest coordination tick/consensus and append it so the agent sees its
+  // current assignment before every turn.
   //
   // Note: this fires every turn. For high-frequency agents, add a short TTL
   // cache here to avoid hammering the backend.
 
   api.on("before_agent_start", async (): Promise<{ prependContext?: string } | undefined> => {
+    const parts: string[] = [OPENHIVE_INSTRUCTIONS];
+
     const room = roomName();
-    if (!room) return undefined;
+    if (room) {
+      const data = await apiGet(`/rooms/${room}/messages?limit=30`, log) as any;
+      const coord = data?.messages?.find(
+        (m: any) =>
+          m.message_type === "coordination_consensus" ||
+          m.message_type === "coordination_tick"
+      );
 
-    const data = await apiGet(`/rooms/${room}/messages?limit=30`, log) as any;
-    if (!data?.messages?.length) return undefined;
-
-    // Messages are returned newest-first; find the most recent coordination event
-    const coord = data.messages.find(
-      (m: any) =>
-        m.message_type === "coordination_consensus" ||
-        m.message_type === "coordination_tick"
-    );
-    if (!coord) return undefined;
-
-    let summary: string;
-    try {
-      const parsed = JSON.parse(coord.content);
-
-      if (coord.message_type === "coordination_consensus") {
-        const plan = parsed.plan ? `Plan: ${parsed.plan}\n` : "";
-        const myAssignment = parsed.assignments?.[handle];
-        const assignBlock = myAssignment
-          ? `Your assignment: ${myAssignment}`
-          : `Assignments:\n${JSON.stringify(parsed.assignments ?? {}, null, 2)}`;
-        summary = `[OpenHive — consensus reached]\n${plan}${assignBlock}`;
-      } else {
-        const questions = (parsed.ambiguities ?? [])
-          .map((q: string, i: number) => `  ${i + 1}. ${q}`)
-          .join("\n");
-        summary =
-          `[OpenHive — coordination tick ${parsed.round ?? "?"}]\n` +
-          `Pending clarifications:\n${questions}`;
+      if (coord) {
+        let summary: string;
+        try {
+          const parsed = JSON.parse(coord.content);
+          if (coord.message_type === "coordination_consensus") {
+            const plan = parsed.plan ? `Plan: ${parsed.plan}\n` : "";
+            const myAssignment = parsed.assignments?.[handle];
+            const assignBlock = myAssignment
+              ? `Your assignment: ${myAssignment}`
+              : `Assignments:\n${JSON.stringify(parsed.assignments ?? {}, null, 2)}`;
+            summary = `[OpenHive — consensus reached]\n${plan}${assignBlock}`;
+          } else {
+            const questions = (parsed.ambiguities ?? [])
+              .map((q: string, i: number) => `  ${i + 1}. ${q}`)
+              .join("\n");
+            summary =
+              `[OpenHive — coordination tick ${parsed.round ?? "?"}]\n` +
+              `Pending clarifications:\n${questions}`;
+          }
+        } catch {
+          summary = `[OpenHive]\n${coord.content}`;
+        }
+        parts.push(summary);
       }
-    } catch {
-      summary = `[OpenHive]\n${coord.content}`;
     }
 
-    return { prependContext: summary };
+    return { prependSystemContext: parts.join("\n\n") };
   });
 
   // ── message_sent ───────────────────────────────────────────────────────────
   // Forward each successful outbound message to the coordination room so other
   // agents and the observer can track this agent's output. Covers "Output Gen
   // Post" from the CFN adapter spec.
+  //
+  // Also POST the turn to /api/knowledge/ingest (fire-and-forget) so the
+  // knowledge graph is populated with each completed turn.
 
   api.on(
     "message_sent",
@@ -227,6 +283,17 @@ export default function register(api: {
         message_type: "broadcast",
         content: event.content,
       }, log);
+
+      // Knowledge ingestion — fire-and-forget, non-fatal
+      if (WORKSPACE_ID && MAS_ID) {
+        const turn: Record<string, unknown> = { response: event.content };
+        apiPost("/api/knowledge/ingest", {
+          workspace_id: WORKSPACE_ID,
+          mas_id: MAS_ID,
+          agent_id: AGENT_ID || undefined,
+          records: [turn],
+        }, log).catch((err) => log.warn(`[openhive-cfn] ingest failed: ${err}`));
+      }
     }
   );
 }

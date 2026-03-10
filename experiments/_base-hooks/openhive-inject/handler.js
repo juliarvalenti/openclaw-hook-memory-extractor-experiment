@@ -2,23 +2,15 @@
  * openhive-inject/handler.js
  *
  * OpenHive hook for OpenClaw.
- * Injects multi-agent coordination instructions into every agent turn via bootstrapFiles.
- * Also extracts the channel/conversation ID from event context and injects it as
+ * Extracts the channel/conversation ID from event context and injects it as
  * OPENHIVE_CHANNEL_ID so all agents in the same Matrix channel share a coordination room.
+ * Also forwards OPENHIVE_API_URL from gateway env into the agent session env.
+ *
+ * Instructions are injected via the openhive-cfn plugin (prependSystemContext),
+ * not here.
  *
  * Installed by: openhive adapter add openclaw
  */
-
-import fs from "fs";
-import path from "path";
-import { fileURLToPath } from "url";
-
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-
-const instructions = fs.readFileSync(
-  path.join(__dirname, "OPENHIVE_INSTRUCTIONS.md"),
-  "utf8"
-);
 
 export default async function HookHandler(event) {
   if (event.type !== "agent" || event.action !== "bootstrap") return;
@@ -43,13 +35,4 @@ export default async function HookHandler(event) {
     ctx.env = ctx.env ?? {};
     ctx.env.OPENHIVE_API_URL = process.env.OPENHIVE_API_URL;
   }
-
-  // Inject coordination instructions into every agent bootstrap
-  ctx.bootstrapFiles = ctx.bootstrapFiles ?? [];
-  ctx.bootstrapFiles.push({
-    name: "OPENHIVE_INSTRUCTIONS",
-    path: "OPENHIVE_INSTRUCTIONS.md",
-    content: instructions,
-    missing: false,
-  });
 }
